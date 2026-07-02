@@ -52,8 +52,10 @@ UNIT_MODEL       = 11
 UNIT_LEGACY_FAN_CONTROL = 12
 UNIT_MIN_FAN_SPEED = 13
 UNIT_THERMAL_CONFIG = 14
+UNIT_POWER_REGULATOR = 15
 
 THERMAL_CONFIG_SELECTOR_STYLE = "1"
+POWER_REGULATOR_SELECTOR_STYLE = "1"
 
 MIN_FAN_PERCENT = 10
 MAX_FAN_PERCENT = 100
@@ -65,6 +67,19 @@ THERMAL_CONFIG_OPTIONS = [
     (40, "Maximum Cooling", ["MaximumCooling", "Maximum", "MaxCooling", "Maximum_Cooling"]),
     (50, "Smooth Cooling", ["SmoothCooling", "Smooth", "Smooth_Cooling"]),
 ]
+
+POWER_REGULATOR_OPTIONS = [
+    (10, "Dynamic Power Savings Mode", ["DynamicPowerSavings", "DynamicPowerSavingsMode", "DynamicPowerSavings_Mode"]),
+    (20, "Static Low Power Mode", ["StaticLowPower", "StaticLowPowerMode", "StaticLowPower_Mode"]),
+    (30, "Static High Performance Mode", ["StaticHighPerf", "StaticHighPerformance", "StaticHighPerformanceMode", "StaticHighPerformance_Mode"]),
+    (40, "OS Control Mode", ["OSControl", "OsControl", "OSControlMode", "OSControl_Mode"]),
+]
+
+POWER_REGULATOR_KEYS = (
+    "PowerRegulator",
+    "PowerRegulatorMode",
+    "PowerProfile",
+)
 
 MIN_FAN_SETTING_KEYS = (
     "FanPercentMinimum",
@@ -171,6 +186,7 @@ class BasePlugin:
         self.heartbeats_per_poll = 1
         self.min_fan_speed_supported = None
         self.thermal_config_supported = None
+        self.power_regulator_supported = None
 
     def onStart(self):
         self.debug = Parameters["Mode6"] == "1"
@@ -206,6 +222,9 @@ class BasePlugin:
             return
         if Unit == UNIT_THERMAL_CONFIG:
             self._handle_thermal_config_command(Level)
+            return
+        if Unit == UNIT_POWER_REGULATOR:
+            self._handle_power_regulator_command(Level)
             return
 
     def _delete_legacy_devices(self):
@@ -268,6 +287,23 @@ class BasePlugin:
             ).Create()
             Domoticz.Log("Created device: Thermal Configuration")
 
+        if UNIT_POWER_REGULATOR not in Devices:
+            Domoticz.Device(
+                Name="Power Regulator",
+                Unit=UNIT_POWER_REGULATOR,
+                TypeName="Selector Switch",
+                Switchtype=18,
+                Options={
+                    "LevelActions": "|||",
+                    "LevelNames": "Off|Dynamic Power Savings Mode|Static Low Power Mode|Static High Performance Mode|OS Control Mode",
+                    "LevelOffHidden": "true",
+                    "SelectorStyle": POWER_REGULATOR_SELECTOR_STYLE
+                },
+                Image=icon_id,
+                Used=1
+            ).Create()
+            Domoticz.Log("Created device: Power Regulator")
+
     def _update_device(self, unit, value, nvalue=0):
         if unit not in Devices:
             return
@@ -295,6 +331,23 @@ class BasePlugin:
         Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
         if self.debug:
             Domoticz.Log("Updated thermal configuration = {}".format(config))
+
+    def _update_power_regulator(self, value):
+        if UNIT_POWER_REGULATOR not in Devices or value is None:
+            return
+        level = self._power_regulator_to_level(value)
+        if level is None:
+            if self.debug:
+                Domoticz.Log("Unknown power regulator value from iLO: {}".format(value))
+            return
+        Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
+        if self.debug:
+            Domoticz.Log("Updated power regulator = {}".format(value))
+
+    def _restore_power_regulator_level(self, level):
+        if UNIT_POWER_REGULATOR not in Devices or level is None:
+            return
+        Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
 
     def _handle_min_fan_speed_command(self, Command, Level):
         previous_level = Devices[UNIT_MIN_FAN_SPEED].sValue if UNIT_MIN_FAN_SPEED in Devices else None
@@ -371,6 +424,44 @@ class BasePlugin:
             self._restore_thermal_config_level(previous_level)
             self._connect_and_update()
 
+    def _handle_power_regulator_command(self, Level):
+        previous_level = Devices[UNIT_POWER_REGULATOR].sValue if UNIT_POWER_REGULATOR in Devices else None
+        if self.power_regulator_supported is False:
+            Domoticz.Log("This iLO does not expose writable power regulator via Redfish; restoring previous level")
+            self._restore_power_regulator_level(previous_level)
+            self._connect_and_update()
+            return
+
+        value = self._power_level_to_value(Level)
+        if value is None:
+            self._restore_power_regulator_level(previous_level)
+            return
+
+        Domoticz.Log("Setting iLO power regulator to {}".format(value))
+
+        try:
+            rf = RedfishILO(
+                host=Parameters["Address"],
+                username=Parameters["Username"],
+                password=Parameters["Password"],
+                port=int(Parameters["Port"])
+            )
+            try:
+                self._set_power_regulator(rf, value)
+                self.power_regulator_supported = True
+                Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
+                Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
+            finally:
+                rf.logout()
+        except Exception as err:
+            if self._is_fan_control_not_writable(err):
+                self.power_regulator_supported = False
+                Domoticz.Error("iLO power regulator is read-only or not exposed through this Redfish path")
+            else:
+                Domoticz.Error("Unable to set iLO power regulator: {}".format(err))
+            self._restore_power_regulator_level(previous_level)
+            self._connect_and_update()
+
     def _restore_thermal_config_level(self, level):
         if UNIT_THERMAL_CONFIG not in Devices or level is None:
             return
@@ -405,6 +496,35 @@ class BasePlugin:
             for key in keys:
                 if source.get(key) is not None:
                     return source.get(key)
+        return None
+
+    def _power_level_to_value(self, level):
+        try:
+            level = int(level)
+        except Exception:
+            return None
+        for item_level, label, aliases in POWER_REGULATOR_OPTIONS:
+            if item_level == level:
+                return aliases[0]
+        return None
+
+    def _power_regulator_to_level(self, value):
+        normalized = str(value).replace(" ", "").replace("_", "").lower()
+        for level, label, aliases in POWER_REGULATOR_OPTIONS:
+            values = [label] + aliases
+            for item in values:
+                if normalized == str(item).replace(" ", "").replace("_", "").lower():
+                    return level
+        return None
+
+    def _get_bios_attribute_value(self, bios, keys):
+        attributes = bios.get("Attributes", {})
+        for key in keys:
+            if attributes.get(key) is not None:
+                return attributes.get(key)
+        for key in keys:
+            if bios.get(key) is not None:
+                return bios.get(key)
         return None
 
     def _thermal_level_to_value(self, level):
@@ -464,6 +584,48 @@ class BasePlugin:
             payloads.append({key: percent})
         self._try_thermal_setting_payloads(rf, payloads)
 
+    def _bios_settings_targets(self, rf):
+        root = rf.get("/redfish/v1/")
+        systems_path = root.get("Systems", {}).get("@odata.id", "/redfish/v1/Systems")
+        system_uri = self._get_first_member_uri(rf, systems_path)
+        bios_path = system_uri.rstrip("/") + "/Bios"
+        bios = rf.get(bios_path)
+        settings_uri = bios.get("@Redfish.Settings", {}).get("SettingsObject", {}).get("@odata.id")
+        targets = []
+        if settings_uri:
+            targets.append(settings_uri)
+        targets.append(bios_path + "/Settings")
+        if self.debug:
+            Domoticz.Log("BIOS setting patch targets: {}".format(", ".join(targets)))
+            Domoticz.Log("BIOS attributes: {}".format(self._json_for_log(bios.get("Attributes", {}))))
+        return targets
+
+    def _try_bios_setting_payloads(self, rf, payloads):
+        errors = []
+        for path in self._bios_settings_targets(rf):
+            for payload in payloads:
+                try:
+                    rf.patch(path, payload)
+                    Domoticz.Log("iLO accepted BIOS setting update via {}".format(path))
+                    return
+                except Exception as err:
+                    errors.append(str(err))
+                    if self.debug:
+                        Domoticz.Log("BIOS setting PATCH failed on {} with {}: {}".format(path, self._json_for_log(payload), err))
+        raise Exception("BIOS setting update not accepted by this iLO Redfish interface ({})".format("; ".join(errors)))
+
+    def _set_power_regulator(self, rf, value):
+        payloads = []
+        aliases = [value]
+        for level, label, values in POWER_REGULATOR_OPTIONS:
+            if value in values:
+                aliases = values
+                break
+        for key in POWER_REGULATOR_KEYS:
+            for item in aliases:
+                payloads.append({"Attributes": {key: item}})
+        self._try_bios_setting_payloads(rf, payloads)
+
     def _set_thermal_configuration(self, rf, config):
         payloads = []
         aliases = [config]
@@ -519,7 +681,8 @@ class BasePlugin:
 
         # System
         try:
-            system      = rf.get(self._get_first_member_uri(rf, systems_path))
+            system_uri  = self._get_first_member_uri(rf, systems_path)
+            system      = rf.get(system_uri)
             model       = system.get("Model",        "Unknown")
             bios        = system.get("BiosVersion",  "")
             model_str   = "{} | BIOS: {}".format(model, bios) if bios else model
@@ -536,6 +699,15 @@ class BasePlugin:
                 Devices[UNIT_HEALTH].Update(nValue=4, sValue=str(health))
         except Exception as err:
             Domoticz.Error("System error: {}".format(err))
+
+        # Power Regulator
+        try:
+            system_uri = self._get_first_member_uri(rf, systems_path)
+            bios = rf.get(system_uri.rstrip("/") + "/Bios")
+            self._update_power_regulator(self._get_bios_attribute_value(bios, POWER_REGULATOR_KEYS))
+        except Exception as err:
+            if self.debug:
+                Domoticz.Log("Power regulator read error: {}".format(err))
 
         # Thermal
         try:

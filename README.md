@@ -74,6 +74,7 @@ After the first start, the following Domoticz devices are created automatically:
 | 11 | `Model` | Text | Server model and BIOS version |
 | 13 | `Minimum Fan Speed` | Dimmer | Sets the HPE `Oem/Hpe/FanPercentMinimum` value |
 | 14 | `Thermal Configuration` | Selector menu | Sets the HPE `Oem/Hpe/ThermalConfiguration` value |
+| 15 | `Power Regulator` | Selector menu | Sets the BIOS `PowerRegulator` attribute |
 
 Unit `12` was previously used for direct fan speed control and is now removed automatically on plugin start. Direct per-fan speed control is not used because the iLO Redfish fan resources are read-only on tested systems.
 
@@ -125,6 +126,31 @@ It updates this Redfish field:
 
 After changing `Thermal Configuration`, iLO may restart or temporarily stop responding. The plugin therefore skips the immediate refresh after a successful change. The next normal poll will update the device state again.
 
+### Power Regulator
+
+The `Power Regulator` device is a selector menu with these options:
+
+- `Dynamic Power Savings Mode`
+- `Static Low Power Mode`
+- `Static High Performance Mode`
+- `OS Control Mode`
+
+It updates the Redfish BIOS settings resource, usually through:
+
+```http
+PATCH /redfish/v1/Systems/1/Bios/Settings
+```
+
+```json
+{
+  "Attributes": {
+    "PowerRegulator": "OSControl"
+  }
+}
+```
+
+Depending on the server model and firmware, this setting may be staged by iLO and may require a server reboot before it becomes active. The plugin updates the Domoticz selector immediately after iLO accepts the setting.
+
 ---
 
 ## Troubleshooting
@@ -132,6 +158,7 @@ After changing `Thermal Configuration`, iLO may restart or temporarily stop resp
 - **iLO login failed** - Verify the username and password.
 - **iLO communication error** - Check the IP address, port, and whether iLO is reachable from the Domoticz server.
 - **Thermal Configuration changed, then iLO is briefly unreachable** - This can happen because iLO applies the setting and restarts or reloads its management interface. Wait for the next poll interval.
+- **Power Regulator changed, but the server behavior does not change immediately** - BIOS power regulator changes may require a server reboot before becoming active.
 - Enable **Debug** in the hardware settings for detailed Redfish request and response logging.
 
 ---
@@ -139,3 +166,4 @@ After changing `Thermal Configuration`, iLO may restart or temporarily stop resp
 ## License
 
 This project was ported from the [Home Assistant HP iLO integration](https://www.home-assistant.io/integrations/hp_ilo).
+
