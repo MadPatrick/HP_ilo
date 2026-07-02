@@ -1,11 +1,11 @@
-"""
+﻿"""
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.1.0
+Version: 1.2.0
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.1.0" wikilink="https://www.home-assistant.io/integrations/hp_ilo" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.0" wikilink="https://www.home-assistant.io/integrations/hp_ilo" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <br/><h2>HP Integrated Lights-Out (iLO)</h2>
         Reads sensor data from an HP iLO interface.
@@ -32,6 +32,7 @@ Version: 1.1.0
 import Domoticz
 import urllib3
 import redfish
+import json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -48,6 +49,41 @@ UNIT_STORAGE     = 8
 UNIT_NETWORK     = 9
 UNIT_SERIAL      = 10
 UNIT_MODEL       = 11
+UNIT_LEGACY_FAN_CONTROL = 12
+UNIT_MIN_FAN_SPEED = 13
+UNIT_THERMAL_CONFIG = 14
+
+THERMAL_CONFIG_SELECTOR_STYLE = "1"
+
+MIN_FAN_PERCENT = 10
+MAX_FAN_PERCENT = 100
+
+THERMAL_CONFIG_OPTIONS = [
+    (10, "Optimal Cooling", ["OptimalCooling", "Optimal", "Optimal_Cooling"]),
+    (20, "Enhanced CPU Cooling", ["EnhancedCPUCooling", "EnhancedCpuCooling", "EnhancedCooling", "Enhanced_CPU_Cooling"]),
+    (30, "Increased Cooling", ["IncreasedCooling", "Increased", "Increased_Cooling"]),
+    (40, "Maximum Cooling", ["MaximumCooling", "Maximum", "MaxCooling", "Maximum_Cooling"]),
+    (50, "Smooth Cooling", ["SmoothCooling", "Smooth", "Smooth_Cooling"]),
+]
+
+MIN_FAN_SETTING_KEYS = (
+    "FanPercentMinimum",
+    "MinimumFanSpeedPercent",
+    "MinimumFanSpeed",
+    "MinFanSpeedPercent",
+    "MinFanSpeed",
+    "FanSpeedMinimum",
+    "FanSpeedMin",
+    "FanMinimumPercent",
+)
+
+THERMAL_CONFIG_KEYS = (
+    "ThermalConfiguration",
+    "ThermalConfig",
+    "CoolingConfiguration",
+    "CoolingMode",
+    "FanConfiguration",
+)
 
 # --- Device Definitions ---
 
@@ -86,6 +122,39 @@ class RedfishILO:
             raise Exception("GET failed (HTTP {}): {}".format(response.status, path))
         return response.dict
 
+    def patch(self, path, payload):
+        if path.startswith("http"):
+            path = path.replace(self.base_url, "")
+        try:
+            response = self.client.patch(path, body=payload)
+        except TypeError:
+            response = self.client.patch(path, payload)
+        if response.status not in [200, 201, 202, 204]:
+            detail = self._response_detail(response)
+            if detail:
+                raise Exception("PATCH failed (HTTP {}): {} -> {}".format(response.status, path, detail))
+            raise Exception("PATCH failed (HTTP {}): {}".format(response.status, path))
+        return getattr(response, "dict", {})
+
+    def _response_detail(self, response):
+        for attr in ("dict", "obj"):
+            value = getattr(response, attr, None)
+            if value:
+                try:
+                    return json.dumps(value)
+                except Exception:
+                    return str(value)
+        for attr in ("text", "content"):
+            value = getattr(response, attr, None)
+            if value:
+                try:
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", "replace")
+                    return str(value)
+                except Exception:
+                    pass
+        return ""
+
     def logout(self):
         try:
             self.client.logout()
@@ -100,6 +169,8 @@ class BasePlugin:
         self.poll_interval       = 300
         self.heartbeat_count     = 0
         self.heartbeats_per_poll = 1
+        self.min_fan_speed_supported = None
+        self.thermal_config_supported = None
 
     def onStart(self):
         self.debug = Parameters["Mode6"] == "1"
@@ -116,6 +187,7 @@ class BasePlugin:
         if "hpilo" not in Images:
             Domoticz.Image("hpilo_icons.zip").Create()
             Domoticz.Log("Created custom icon: hpilo")
+        self._delete_legacy_devices()
         self._create_devices()
         self._connect_and_update()
 
@@ -128,6 +200,30 @@ class BasePlugin:
             self.heartbeat_count = 0
             self._connect_and_update()
 
+    def onCommand(self, Unit, Command, Level, Color):
+        if Unit == UNIT_MIN_FAN_SPEED:
+            self._handle_min_fan_speed_command(Command, Level)
+            return
+        if Unit == UNIT_THERMAL_CONFIG:
+            self._handle_thermal_config_command(Level)
+            return
+
+    def _delete_legacy_devices(self):
+        if UNIT_LEGACY_FAN_CONTROL in Devices:
+            try:
+                Devices[UNIT_LEGACY_FAN_CONTROL].Delete()
+                Domoticz.Log("Deleted legacy device: Fan Speed Control")
+            except Exception as err:
+                Domoticz.Error("Unable to delete legacy Fan Speed Control device: {}".format(err))
+
+        if UNIT_THERMAL_CONFIG in Devices:
+            try:
+                options = getattr(Devices[UNIT_THERMAL_CONFIG], "Options", {})
+                if options.get("SelectorStyle") != THERMAL_CONFIG_SELECTOR_STYLE:
+                    Devices[UNIT_THERMAL_CONFIG].Delete()
+                    Domoticz.Log("Recreated Thermal Configuration as selector menu")
+            except Exception as err:
+                Domoticz.Error("Unable to recreate Thermal Configuration selector: {}".format(err))
     def _create_devices(self):
         icon_id = Images["hpilo"].ID if "hpilo" in Images else 0
         for unit, name, type_num, subtype, options in SENSOR_DEFINITIONS:
@@ -143,12 +239,148 @@ class BasePlugin:
                 ).Create()
                 Domoticz.Log("Created device: {}".format(name))
 
+
+        if UNIT_MIN_FAN_SPEED not in Devices:
+            Domoticz.Device(
+                Name="Minimum Fan Speed",
+                Unit=UNIT_MIN_FAN_SPEED,
+                TypeName="Dimmer",
+                Switchtype=7,
+                Image=icon_id,
+                Used=1
+            ).Create()
+            Domoticz.Log("Created device: Minimum Fan Speed")
+
+        if UNIT_THERMAL_CONFIG not in Devices:
+            Domoticz.Device(
+                Name="Thermal Configuration",
+                Unit=UNIT_THERMAL_CONFIG,
+                TypeName="Selector Switch",
+                Switchtype=18,
+                Options={
+                    "LevelActions": "|||||",
+                    "LevelNames": "Off|Optimal Cooling|Enhanced CPU Cooling|Increased Cooling|Maximum Cooling|Smooth Cooling",
+                    "LevelOffHidden": "true",
+                    "SelectorStyle": THERMAL_CONFIG_SELECTOR_STYLE
+                },
+                Image=icon_id,
+                Used=1
+            ).Create()
+            Domoticz.Log("Created device: Thermal Configuration")
+
     def _update_device(self, unit, value, nvalue=0):
         if unit not in Devices:
             return
         Devices[unit].Update(nValue=nvalue, sValue=str(value))
         if self.debug:
             Domoticz.Log("Updated unit {} = {}".format(unit, value))
+
+
+    def _update_min_fan_speed(self, percent):
+        if UNIT_MIN_FAN_SPEED not in Devices or percent is None:
+            return
+        level = self._clamp_fan_percent(percent)
+        Devices[UNIT_MIN_FAN_SPEED].Update(nValue=2, sValue=str(level))
+        if self.debug:
+            Domoticz.Log("Updated minimum fan speed = {}%".format(level))
+
+    def _update_thermal_config(self, config):
+        if UNIT_THERMAL_CONFIG not in Devices or config is None:
+            return
+        level = self._thermal_config_to_level(config)
+        if level is None:
+            if self.debug:
+                Domoticz.Log("Unknown thermal configuration value from iLO: {}".format(config))
+            return
+        Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
+        if self.debug:
+            Domoticz.Log("Updated thermal configuration = {}".format(config))
+
+    def _handle_min_fan_speed_command(self, Command, Level):
+        previous_level = Devices[UNIT_MIN_FAN_SPEED].sValue if UNIT_MIN_FAN_SPEED in Devices else None
+        if self.min_fan_speed_supported is False:
+            Domoticz.Log("This iLO does not expose writable minimum fan speed via Redfish; restoring previous level")
+            self._update_min_fan_speed(previous_level)
+            self._connect_and_update()
+            return
+
+        percent = Level if Command == "Set Level" else previous_level
+        percent = self._clamp_fan_percent(percent)
+        Domoticz.Log("Setting iLO minimum fan speed to {}%".format(percent))
+
+        try:
+            rf = RedfishILO(
+                host=Parameters["Address"],
+                username=Parameters["Username"],
+                password=Parameters["Password"],
+                port=int(Parameters["Port"])
+            )
+            try:
+                self._set_min_fan_speed_percent(rf, percent)
+                self.min_fan_speed_supported = True
+                self._update_min_fan_speed(percent)
+                self._fetch_and_push(rf)
+            finally:
+                rf.logout()
+        except Exception as err:
+            if self._is_fan_control_not_writable(err):
+                self.min_fan_speed_supported = False
+                Domoticz.Error("iLO minimum fan speed is read-only or not exposed through this Redfish path")
+            else:
+                Domoticz.Error("Unable to set iLO minimum fan speed: {}".format(err))
+            self._update_min_fan_speed(previous_level)
+            self._connect_and_update()
+
+    def _handle_thermal_config_command(self, Level):
+        previous_level = Devices[UNIT_THERMAL_CONFIG].sValue if UNIT_THERMAL_CONFIG in Devices else None
+        if self.thermal_config_supported is False:
+            Domoticz.Log("This iLO does not expose writable thermal configuration via Redfish; restoring previous level")
+            self._restore_thermal_config_level(previous_level)
+            self._connect_and_update()
+            return
+
+        config = self._thermal_level_to_value(Level)
+        if config is None:
+            self._restore_thermal_config_level(previous_level)
+            return
+
+        Domoticz.Log("Setting iLO thermal configuration to {}".format(config))
+
+        try:
+            rf = RedfishILO(
+                host=Parameters["Address"],
+                username=Parameters["Username"],
+                password=Parameters["Password"],
+                port=int(Parameters["Port"])
+            )
+            try:
+                self._set_thermal_configuration(rf, config)
+                self.thermal_config_supported = True
+                Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
+                Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
+                return
+            finally:
+                if not self.thermal_config_supported:
+                    rf.logout()
+        except Exception as err:
+            if self._is_fan_control_not_writable(err):
+                self.thermal_config_supported = False
+                Domoticz.Error("iLO thermal configuration is read-only or not exposed through this Redfish path")
+            else:
+                Domoticz.Error("Unable to set iLO thermal configuration: {}".format(err))
+            self._restore_thermal_config_level(previous_level)
+            self._connect_and_update()
+
+    def _restore_thermal_config_level(self, level):
+        if UNIT_THERMAL_CONFIG not in Devices or level is None:
+            return
+        Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
+    def _clamp_fan_percent(self, value):
+        try:
+            percent = int(round(float(value)))
+        except Exception:
+            percent = MIN_FAN_PERCENT
+        return max(MIN_FAN_PERCENT, min(MAX_FAN_PERCENT, percent))
 
     def _connect_and_update(self):
         try:
@@ -163,6 +395,96 @@ class BasePlugin:
         except Exception as err:
             Domoticz.Error("Redfish connection error: {}".format(err))
 
+    def _get_hpe_oem(self, data):
+        oem = data.get("Oem", {})
+        return oem.get("Hpe", oem.get("Hp", {}))
+
+    def _get_thermal_setting_value(self, thermal, keys):
+        hpe = self._get_hpe_oem(thermal)
+        for source in (hpe, thermal):
+            for key in keys:
+                if source.get(key) is not None:
+                    return source.get(key)
+        return None
+
+    def _thermal_level_to_value(self, level):
+        try:
+            level = int(level)
+        except Exception:
+            return None
+        for item_level, label, aliases in THERMAL_CONFIG_OPTIONS:
+            if item_level == level:
+                return aliases[0]
+        return None
+
+    def _thermal_config_to_level(self, config):
+        normalized = str(config).replace(" ", "").replace("_", "").lower()
+        for level, label, aliases in THERMAL_CONFIG_OPTIONS:
+            values = [label] + aliases
+            for value in values:
+                if normalized == str(value).replace(" ", "").replace("_", "").lower():
+                    return level
+        return None
+
+    def _thermal_patch_targets(self, rf):
+        root = rf.get("/redfish/v1/")
+        chassis_path = root.get("Chassis", {}).get("@odata.id", "/redfish/v1/Chassis")
+        chassis_uri = self._get_first_member_uri(rf, chassis_path)
+        thermal_path = chassis_uri.rstrip("/") + "/Thermal"
+        thermal = rf.get(thermal_path)
+        settings_uri = thermal.get("@Redfish.Settings", {}).get("SettingsObject", {}).get("@odata.id")
+        targets = []
+        if settings_uri:
+            targets.append(settings_uri)
+        targets.append(thermal_path)
+        if self.debug:
+            Domoticz.Log("Thermal setting patch targets: {}".format(", ".join(targets)))
+            Domoticz.Log("Thermal OEM HPE data: {}".format(self._json_for_log(self._get_hpe_oem(thermal))))
+        return targets
+
+    def _try_thermal_setting_payloads(self, rf, payloads):
+        errors = []
+        for path in self._thermal_patch_targets(rf):
+            for payload in payloads:
+                try:
+                    rf.patch(path, payload)
+                    Domoticz.Log("iLO accepted thermal setting update via {}".format(path))
+                    return
+                except Exception as err:
+                    errors.append(str(err))
+                    if self.debug:
+                        Domoticz.Log("Thermal setting PATCH failed on {} with {}: {}".format(path, self._json_for_log(payload), err))
+        raise Exception("thermal setting update not accepted by this iLO Redfish interface ({})".format("; ".join(errors)))
+
+    def _set_min_fan_speed_percent(self, rf, percent):
+        payloads = []
+        for key in MIN_FAN_SETTING_KEYS:
+            payloads.append({"Oem": {"Hpe": {key: percent}}})
+            payloads.append({"Oem": {"Hp": {key: percent}}})
+            payloads.append({key: percent})
+        self._try_thermal_setting_payloads(rf, payloads)
+
+    def _set_thermal_configuration(self, rf, config):
+        payloads = []
+        aliases = [config]
+        for level, label, values in THERMAL_CONFIG_OPTIONS:
+            if config in values:
+                aliases = values
+                break
+        for key in THERMAL_CONFIG_KEYS:
+            for value in aliases:
+                payloads.append({"Oem": {"Hpe": {key: value}}})
+                payloads.append({"Oem": {"Hp": {key: value}}})
+                payloads.append({key: value})
+        self._try_thermal_setting_payloads(rf, payloads)
+    def _is_fan_control_not_writable(self, err):
+        message = str(err)
+        return (
+            "PropertyNotWritableOrUnknown" in message or
+            "HTTP 405" in message or
+            "not accepted by this iLO Redfish interface" in message
+        )
+
     def _get_first_member_uri(self, rf, collection_path):
         data    = rf.get(collection_path)
         members = data.get("Members", [])
@@ -172,6 +494,17 @@ class BasePlugin:
         if not uri:
             raise Exception("No @odata.id in first member of: {}".format(collection_path))
         return uri
+
+
+    def _json_for_log(self, value):
+        try:
+            text = json.dumps(value, sort_keys=True)
+        except Exception:
+            text = str(value)
+        if len(text) > 900:
+            return text[:900] + "..."
+        return text
+
 
     def _fetch_and_push(self, rf):
         root = rf.get("/redfish/v1/")
@@ -206,10 +539,12 @@ class BasePlugin:
 
         # Thermal
         try:
-            thermal    = rf.get(self._get_first_member_uri(rf, chassis_path) + "/Thermal")
-            fans       = thermal.get("Fans", [])
-            fan_speed  = fans[0].get("Reading", 0) if fans else 0
+            thermal     = rf.get(self._get_first_member_uri(rf, chassis_path) + "/Thermal")
+            fans        = thermal.get("Fans", [])
+            fan_speed   = fans[0].get("Reading", 0) if fans else 0
             self._update_device(UNIT_FAN_SPEED, fan_speed)
+            self._update_min_fan_speed(self._get_thermal_setting_value(thermal, MIN_FAN_SETTING_KEYS))
+            self._update_thermal_config(self._get_thermal_setting_value(thermal, THERMAL_CONFIG_KEYS))
 
             cpu_temp   = None
             inlet_temp = None
@@ -332,3 +667,13 @@ _plugin = BasePlugin()
 def onStart():    _plugin.onStart()
 def onStop():     _plugin.onStop()
 def onHeartbeat(): _plugin.onHeartbeat()
+def onCommand(Unit, Command, Level, Color): _plugin.onCommand(Unit, Command, Level, Color)
+
+
+
+
+
+
+
+
+

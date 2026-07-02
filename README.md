@@ -1,6 +1,6 @@
-# HP Integrated Lights-Out (iLO) – Domoticz Plugin
+﻿# HP Integrated Lights-Out (iLO) - Domoticz Plugin
 
-A Domoticz Python plugin to read sensor data from an HP iLO interface via Redfish.
+A Domoticz Python plugin to read HP iLO sensor data via Redfish and manage supported HPE thermal settings.
 
 ---
 
@@ -42,7 +42,7 @@ pip3 install redfish
 
 ## Configuration
 
-In Domoticz, go to **Settings → Hardware** and add a new hardware device of type **HP Integrated Lights-Out (iLO)**.
+In Domoticz, go to **Settings -> Hardware** and add a new hardware device of type **HP Integrated Lights-Out (iLO)**.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -50,37 +50,89 @@ In Domoticz, go to **Settings → Hardware** and add a new hardware device of ty
 | Port | TCP port of the iLO interface | `443` |
 | Username | iLO login username | `Administrator` |
 | Password | iLO login password | *(empty)* |
-| Poll interval (sec) | How often data is retrieved (in seconds) | `300` |
-| Protocol | Connection protocol | `Automatic` |
+| Poll interval (sec) | How often data is retrieved, in seconds | `300` |
 | Debug | Enable or disable verbose logging | `Off` |
 
 ---
 
-## Created devices
+## Created Devices
 
-After the first successful connection, the following Domoticz devices are created automatically:
+After the first start, the following Domoticz devices are created automatically:
 
-| Unit | Name | Description |
-|------|------|-------------|
-| 1 | `Server Name` | Hostname of the server |
-| 2 | `Power State` | Power status (On/Off) |
-| 3 | `Health` | Overall hardware health (OK / degraded) |
-| 4 | `Fan Speed` | Speed of the first fan (RPM) |
-| 5 | `CPU Temperature` | CPU temperature (°C) |
-| 6 | `Inlet Temperature` | Inlet ambient temperature (°C) |
-| 7 | `iLO Firmware` | iLO firmware version |
-| 8 | `Storage` | Storage/RAID health status |
-| 9 | `Network` | IP address and MAC address of the iLO interface |
-| 10 | `Serial Number` | Server serial number |
-| 11 | `Model` | Server model and BIOS version |
+| Unit | Name | Type | Description |
+|------|------|------|-------------|
+| 1 | `Server Name` | Text | Hostname of the server |
+| 2 | `Power State` | Text | Power status |
+| 3 | `Health` | Alert | Overall hardware health |
+| 4 | `Fan Speed` | Custom sensor | Speed of the first fan in RPM |
+| 5 | `CPU Temperature` | Custom sensor | CPU temperature in Celsius |
+| 6 | `Inlet Temperature` | Custom sensor | Inlet or ambient temperature in Celsius |
+| 7 | `iLO Firmware` | Text | iLO firmware version |
+| 8 | `Storage` | Alert | Storage or RAID health status |
+| 9 | `Network` | Text | IP address and MAC address of the iLO interface |
+| 10 | `Serial Number` | Text | Server serial number |
+| 11 | `Model` | Text | Server model and BIOS version |
+| 13 | `Minimum Fan Speed` | Dimmer | Sets the HPE `Oem/Hpe/FanPercentMinimum` value |
+| 14 | `Thermal Configuration` | Selector menu | Sets the HPE `Oem/Hpe/ThermalConfiguration` value |
+
+Unit `12` was previously used for direct fan speed control and is now removed automatically on plugin start. Direct per-fan speed control is not used because the iLO Redfish fan resources are read-only on tested systems.
+
+---
+
+## Fan Settings
+
+### Minimum Fan Speed
+
+The `Minimum Fan Speed` dimmer updates this Redfish field:
+
+```http
+PATCH /redfish/v1/Chassis/1/Thermal
+```
+
+```json
+{
+  "Oem": {
+    "Hpe": {
+      "FanPercentMinimum": 25
+    }
+  }
+}
+```
+
+The plugin also reads the same value from `Oem/Hpe/FanPercentMinimum` and updates the Domoticz dimmer.
+
+### Thermal Configuration
+
+The `Thermal Configuration` device is a selector menu with these options:
+
+- `Optimal Cooling`
+- `Enhanced CPU Cooling`
+- `Increased Cooling`
+- `Maximum Cooling`
+- `Smooth Cooling`
+
+It updates this Redfish field:
+
+```json
+{
+  "Oem": {
+    "Hpe": {
+      "ThermalConfiguration": "OptimalCooling"
+    }
+  }
+}
+```
+
+After changing `Thermal Configuration`, iLO may restart or temporarily stop responding. The plugin therefore skips the immediate refresh after a successful change. The next normal poll will update the device state again.
 
 ---
 
 ## Troubleshooting
 
-- **iLO login failed** – Verify the username and password.
-- **iLO communication error** – Check the IP address, port, and whether iLO is reachable from the Domoticz server.
-- Enable **Debug** in hardware settings for detailed log messages in the Domoticz log.
+- **iLO login failed** - Verify the username and password.
+- **iLO communication error** - Check the IP address, port, and whether iLO is reachable from the Domoticz server.
+- **Thermal Configuration changed, then iLO is briefly unreachable** - This can happen because iLO applies the setting and restarts or reloads its management interface. Wait for the next poll interval.
+- Enable **Debug** in the hardware settings for detailed Redfish request and response logging.
 
 ---
 
