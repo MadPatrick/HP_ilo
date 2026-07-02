@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 UNIT_SERVER_NAME = 1
 UNIT_POWER_STATE = 2
 UNIT_HEALTH      = 3
-UNIT_FAN_SPEED   = 4
+UNIT_LEGACY_FAN_SPEED = 4
 UNIT_CPU_TEMP    = 5
 UNIT_INLET_TEMP  = 6
 UNIT_FIRMWARE    = 7
@@ -49,10 +49,9 @@ UNIT_STORAGE     = 8
 UNIT_NETWORK     = 9
 UNIT_SERIAL      = 10
 UNIT_MODEL       = 11
-UNIT_LEGACY_FAN_CONTROL = 12
-UNIT_MIN_FAN_SPEED = 13
-UNIT_THERMAL_CONFIG = 14
-UNIT_POWER_REGULATOR = 15
+UNIT_MIN_FAN_SPEED = 12
+UNIT_THERMAL_CONFIG = 13
+UNIT_POWER_REGULATOR = 14
 
 THERMAL_CONFIG_SELECTOR_STYLE = "1"
 POWER_REGULATOR_SELECTOR_STYLE = "1"
@@ -106,7 +105,6 @@ SENSOR_DEFINITIONS = [
     (UNIT_SERVER_NAME, "Server Name",       243, 19, {}),
     (UNIT_POWER_STATE, "Power State",       243, 19, {}),
     (UNIT_HEALTH,      "Health",            243, 22, {}),
-    (UNIT_FAN_SPEED,   "Fan Speed",         243,  6, {}),
     (UNIT_CPU_TEMP,    "CPU Temperature",    80,  5, {"Custom": "1;C"}),
     (UNIT_INLET_TEMP,  "Inlet Temperature",  80,  5, {"Custom": "1;C"}),
     (UNIT_FIRMWARE,    "iLO Firmware",      243, 19, {}),
@@ -228,12 +226,12 @@ class BasePlugin:
             return
 
     def _delete_legacy_devices(self):
-        if UNIT_LEGACY_FAN_CONTROL in Devices:
+        if UNIT_LEGACY_FAN_SPEED in Devices:
             try:
-                Devices[UNIT_LEGACY_FAN_CONTROL].Delete()
-                Domoticz.Log("Deleted legacy device: Fan Speed Control")
+                Devices[UNIT_LEGACY_FAN_SPEED].Delete()
+                Domoticz.Log("Deleted legacy device: Fan Speed")
             except Exception as err:
-                Domoticz.Error("Unable to delete legacy Fan Speed Control device: {}".format(err))
+                Domoticz.Error("Unable to delete legacy Fan Speed device: {}".format(err))
 
         if UNIT_THERMAL_CONFIG in Devices:
             try:
@@ -712,9 +710,6 @@ class BasePlugin:
         # Thermal
         try:
             thermal     = rf.get(self._get_first_member_uri(rf, chassis_path) + "/Thermal")
-            fans        = thermal.get("Fans", [])
-            fan_speed   = fans[0].get("Reading", 0) if fans else 0
-            self._update_device(UNIT_FAN_SPEED, fan_speed)
             self._update_min_fan_speed(self._get_thermal_setting_value(thermal, MIN_FAN_SETTING_KEYS))
             self._update_thermal_config(self._get_thermal_setting_value(thermal, THERMAL_CONFIG_KEYS))
 

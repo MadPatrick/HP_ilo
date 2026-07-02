@@ -64,7 +64,6 @@ After the first start, the following Domoticz devices are created automatically:
 | 1 | `Server Name` | Text | Hostname of the server |
 | 2 | `Power State` | Text | Power status |
 | 3 | `Health` | Alert | Overall hardware health |
-| 4 | `Fan Speed` | Custom sensor | Speed of the first fan in RPM |
 | 5 | `CPU Temperature` | Custom sensor | CPU temperature in Celsius |
 | 6 | `Inlet Temperature` | Custom sensor | Inlet or ambient temperature in Celsius |
 | 7 | `iLO Firmware` | Text | iLO firmware version |
@@ -72,11 +71,11 @@ After the first start, the following Domoticz devices are created automatically:
 | 9 | `Network` | Text | IP address and MAC address of the iLO interface |
 | 10 | `Serial Number` | Text | Server serial number |
 | 11 | `Model` | Text | Server model and BIOS version |
-| 13 | `Minimum Fan Speed` | Dimmer | Sets the HPE `Oem/Hpe/FanPercentMinimum` value |
-| 14 | `Thermal Configuration` | Selector menu | Sets the HPE `Oem/Hpe/ThermalConfiguration` value |
-| 15 | `Power Regulator` | Selector menu | Sets the BIOS `PowerRegulator` attribute |
+| 12 | `Minimum Fan Speed` | Dimmer | Sets the HPE `Oem/Hpe/FanPercentMinimum` value |
+| 13 | `Thermal Configuration` | Selector menu | Sets the HPE `Oem/Hpe/ThermalConfiguration` value |
+| 14 | `Power Regulator` | Selector menu | Sets the BIOS `PowerRegulator` attribute |
 
-Unit `12` was previously used for direct fan speed control and is now removed automatically on plugin start. Direct per-fan speed control is not used because the iLO Redfish fan resources are read-only on tested systems.
+Unit `4` was previously used for fan RPM and is now removed automatically on plugin start. Fan control is handled through unit `12` (`Minimum Fan Speed`), which writes the supported HPE `FanPercentMinimum` setting.
 
 ---
 
