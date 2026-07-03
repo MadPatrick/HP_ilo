@@ -64,6 +64,7 @@ After the first start, the following Domoticz devices are created automatically:
 | 1 | `Server Name` | Text | Hostname of the server |
 | 2 | `Power State` | Text | Power status |
 | 3 | `Health` | Alert | Overall hardware health |
+| 4 | `SSD Lifetime` | Custom sensor | Lowest remaining SSD lifetime in percent |
 | 5 | `CPU Temperature` | Custom sensor | CPU temperature in Celsius |
 | 6 | `Inlet Temperature` | Custom sensor | Inlet or ambient temperature in Celsius |
 | 7 | `iLO Firmware` | Text | iLO firmware version |
@@ -75,7 +76,7 @@ After the first start, the following Domoticz devices are created automatically:
 | 13 | `Thermal Configuration` | Selector menu | Sets the HPE `Oem/Hpe/ThermalConfiguration` value |
 | 14 | `Power Regulator` | Selector menu | Sets the BIOS `PowerRegulator` attribute |
 
-Unit `4` was previously used for fan RPM and is now removed automatically on plugin start. Fan control is handled through unit `12` (`Minimum Fan Speed`), which writes the supported HPE `FanPercentMinimum` setting.
+Unit `4` was previously used for fan RPM and is now reused as `SSD Lifetime`. Fan control is handled through unit `12` (`Minimum Fan Speed`), which writes the supported HPE `FanPercentMinimum` setting.
 
 ---
 
