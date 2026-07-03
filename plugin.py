@@ -2,12 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.0
+Version: 1.2.1
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.0" wikilink="https://www.home-assistant.io/integrations/hp_ilo" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.1" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <br/><h2>HP Integrated Lights-Out (iLO)</h2>
+        Version: 1.2.1<br/>
         Reads sensor data from an HP iLO interface.
         <br/><br/>
         <h3>Parameters</h3>
@@ -41,7 +42,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 UNIT_SERVER_NAME = 1
 UNIT_POWER_STATE = 2
 UNIT_HEALTH      = 3
-UNIT_LEGACY_FAN_SPEED = 4
+UNIT_SSD_LIFETIME = 4
 UNIT_CPU_TEMP    = 5
 UNIT_INLET_TEMP  = 6
 UNIT_FIRMWARE    = 7
@@ -105,6 +106,7 @@ SENSOR_DEFINITIONS = [
     (UNIT_SERVER_NAME, "Server Name",       243, 19, {}),
     (UNIT_POWER_STATE, "Power State",       243, 19, {}),
     (UNIT_HEALTH,      "Health",            243, 22, {}),
+    (UNIT_SSD_LIFETIME, "SSD Lifetime",      243,  6, {}),
     (UNIT_CPU_TEMP,    "CPU Temperature",    80,  5, {"Custom": "1;C"}),
     (UNIT_INLET_TEMP,  "Inlet Temperature",  80,  5, {"Custom": "1;C"}),
     (UNIT_FIRMWARE,    "iLO Firmware",      243, 19, {}),
@@ -226,13 +228,6 @@ class BasePlugin:
             return
 
     def _delete_legacy_devices(self):
-        if UNIT_LEGACY_FAN_SPEED in Devices:
-            try:
-                Devices[UNIT_LEGACY_FAN_SPEED].Delete()
-                Domoticz.Log("Deleted legacy device: Fan Speed")
-            except Exception as err:
-                Domoticz.Error("Unable to delete legacy Fan Speed device: {}".format(err))
-
         if UNIT_THERMAL_CONFIG in Devices:
             try:
                 options = getattr(Devices[UNIT_THERMAL_CONFIG], "Options", {})
@@ -241,6 +236,14 @@ class BasePlugin:
                     Domoticz.Log("Recreated Thermal Configuration as selector menu")
             except Exception as err:
                 Domoticz.Error("Unable to recreate Thermal Configuration selector: {}".format(err))
+
+        if UNIT_SSD_LIFETIME in Devices:
+            try:
+                if Devices[UNIT_SSD_LIFETIME].Name != "SSD Lifetime":
+                    Devices[UNIT_SSD_LIFETIME].Delete()
+                    Domoticz.Log("Recreated unit 4 as SSD Lifetime")
+            except Exception as err:
+                Domoticz.Error("Unable to recreate SSD Lifetime device: {}".format(err))
     def _create_devices(self):
         icon_id = Images["hpilo"].ID if "hpilo" in Images else 0
         for unit, name, type_num, subtype, options in SENSOR_DEFINITIONS:
@@ -656,6 +659,57 @@ class BasePlugin:
         return uri
 
 
+    def _get_drive_lifetime_percent(self, drive):
+        for key in (
+            "PredictedMediaLifeLeftPercent",
+            "RemainingLifePercent",
+            "PercentLifeRemaining",
+            "MediaLifeLeftPercent",
+            "SSDLifeLeft",
+        ):
+            if drive.get(key) is not None:
+                return self._clamp_percent(drive.get(key))
+
+        oem = drive.get("Oem", {})
+        for vendor in ("Hpe", "Hp"):
+            data = oem.get(vendor, {})
+            for key in (
+                "PredictedMediaLifeLeftPercent",
+                "RemainingLifePercent",
+                "PercentLifeRemaining",
+                "MediaLifeLeftPercent",
+                "SSDLifeLeft",
+            ):
+                if data.get(key) is not None:
+                    return self._clamp_percent(data.get(key))
+
+            # Some controllers report endurance used instead of lifetime left.
+            for key in ("SSDEnduranceUtilizationPercentage", "DriveLifeUsedPercent", "PercentLifeUsed"):
+                if data.get(key) is not None:
+                    return self._clamp_percent(100 - float(data.get(key)))
+
+        for key in ("SSDEnduranceUtilizationPercentage", "DriveLifeUsedPercent", "PercentLifeUsed"):
+            if drive.get(key) is not None:
+                return self._clamp_percent(100 - float(drive.get(key)))
+        return None
+
+    def _clamp_percent(self, value):
+        try:
+            percent = int(round(float(value)))
+        except Exception:
+            return None
+        return max(0, min(100, percent))
+
+    def _update_ssd_lifetime(self, lifetime):
+        if UNIT_SSD_LIFETIME not in Devices or lifetime is None:
+            return
+        level = self._clamp_percent(lifetime)
+        if level is None:
+            return
+        Devices[UNIT_SSD_LIFETIME].Update(nValue=0, sValue=str(level))
+        if self.debug:
+            Domoticz.Log("Updated SSD lifetime = {}%".format(level))
+
     def _json_for_log(self, value):
         try:
             text = json.dumps(value, sort_keys=True)
@@ -759,6 +813,7 @@ class BasePlugin:
             storage_path = system_uri.rstrip("/") + "/Storage"
             storage      = rf.get(storage_path)
             drives       = []
+            ssd_lifetimes = []
             any_bad      = False
 
             for member in storage.get("Members", []):
@@ -776,6 +831,9 @@ class BasePlugin:
                         capacity    = drive.get("CapacityBytes", 0)
                         capacity_gb = round(capacity / 1e9, 1) if capacity else 0
                         media       = drive.get("MediaType", "Unknown")
+                        lifetime   = self._get_drive_lifetime_percent(drive)
+                        if lifetime is not None and str(media).lower() in ("ssd", "solidstate", "solid state drive"):
+                            ssd_lifetimes.append(lifetime)
                         drives.append({
                             "gb":     capacity_gb,
                             "media":  media,
@@ -818,6 +876,9 @@ class BasePlugin:
                 sValue = "\n".join(parts)
                 nValue = 4 if any_bad else 1
                 Devices[UNIT_STORAGE].Update(nValue=nValue, sValue=sValue)
+
+            if ssd_lifetimes:
+                self._update_ssd_lifetime(min(ssd_lifetimes))
 
         except Exception as err:
             if "404" in str(err):
