@@ -8,12 +8,12 @@ A Domoticz Python plugin to read HP iLO sensor data via Redfish and manage suppo
 
 - Domoticz with Python plugin support (version 2020.2 or newer recommended)
 - Python 3
-- The `redfish` Python library
+- Python dependencies listed in `requirements.txt`
 
-### Install the Python library
+### Install the Python dependencies
 
 ```bash
-pip3 install redfish
+pip3 install -r requirements.txt
 ```
 
 ---
@@ -166,4 +166,3 @@ Depending on the server model and firmware, this setting may be staged by iLO an
 ## License
 
 This project was ported from the [Home Assistant HP iLO integration](https://www.home-assistant.io/integrations/hp_ilo).
-
