@@ -413,9 +413,9 @@ class BasePlugin:
                 self.thermal_config_supported = True
                 Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
+                return
             finally:
                 rf.logout()
-            return
         except Exception as err:
             if self._is_fan_control_not_writable(err):
                 self.thermal_config_supported = False
