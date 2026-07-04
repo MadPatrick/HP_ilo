@@ -1,14 +1,14 @@
-﻿"""
+"""
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.1
+Version: 1.2.2
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.1" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.2" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <br/><h2>HP Integrated Lights-Out (iLO)</h2>
-        Version: 1.2.1<br/>
+        Version: 1.2.2<br/>
         Reads sensor data from an HP iLO interface.
         <br/><br/>
         <h3>Parameters</h3>
@@ -244,6 +244,7 @@ class BasePlugin:
                     Domoticz.Log("Recreated unit 4 as SSD Lifetime")
             except Exception as err:
                 Domoticz.Error("Unable to recreate SSD Lifetime device: {}".format(err))
+
     def _create_devices(self):
         icon_id = Images["hpilo"].ID if "hpilo" in Images else 0
         for unit, name, type_num, subtype, options in SENSOR_DEFINITIONS:
@@ -414,8 +415,7 @@ class BasePlugin:
                 Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
                 return
             finally:
-                if not self.thermal_config_supported:
-                    rf.logout()
+                rf.logout()
         except Exception as err:
             if self._is_fan_control_not_writable(err):
                 self.thermal_config_supported = False
@@ -467,6 +467,7 @@ class BasePlugin:
         if UNIT_THERMAL_CONFIG not in Devices or level is None:
             return
         Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
+
     def _clamp_fan_percent(self, value):
         try:
             percent = int(round(float(value)))
@@ -482,8 +483,10 @@ class BasePlugin:
                 password=Parameters["Password"],
                 port=int(Parameters["Port"])
             )
-            self._fetch_and_push(rf)
-            rf.logout()
+            try:
+                self._fetch_and_push(rf)
+            finally:
+                rf.logout()
         except Exception as err:
             Domoticz.Error("Redfish connection error: {}".format(err))
 
@@ -731,6 +734,7 @@ class BasePlugin:
             Domoticz.Log("Chassis:  {}".format(chassis_path))
             Domoticz.Log("Managers: {}".format(managers_path))
 
+        system_uri = None
         # System
         try:
             system_uri  = self._get_first_member_uri(rf, systems_path)
@@ -754,7 +758,8 @@ class BasePlugin:
 
         # Power Regulator
         try:
-            system_uri = self._get_first_member_uri(rf, systems_path)
+            if system_uri is None:
+                system_uri = self._get_first_member_uri(rf, systems_path)
             bios = rf.get(system_uri.rstrip("/") + "/Bios")
             self._update_power_regulator(self._get_bios_attribute_value(bios, POWER_REGULATOR_KEYS))
         except Exception as err:
@@ -809,7 +814,8 @@ class BasePlugin:
 
         # Storage
         try:
-            system_uri   = self._get_first_member_uri(rf, systems_path)
+            if system_uri is None:
+                system_uri = self._get_first_member_uri(rf, systems_path)
             storage_path = system_uri.rstrip("/") + "/Storage"
             storage      = rf.get(storage_path)
             drives       = []
@@ -886,7 +892,6 @@ class BasePlugin:
             else:
                 Domoticz.Error("Storage error: {}".format(err))
 
-#        Domoticz.Log("Redfish update completed")
 
 # --- Domoticz Hooks ---
 
@@ -896,12 +901,3 @@ def onStart():    _plugin.onStart()
 def onStop():     _plugin.onStop()
 def onHeartbeat(): _plugin.onHeartbeat()
 def onCommand(Unit, Command, Level, Color): _plugin.onCommand(Unit, Command, Level, Color)
-
-
-
-
-
-
-
-
-
