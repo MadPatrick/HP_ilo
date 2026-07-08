@@ -100,7 +100,7 @@ PATCH /redfish/v1/Chassis/1/Thermal
 }
 ```
 
-The plugin also reads the same value from `Oem/Hpe/FanPercentMinimum` and updates the Domoticz dimmer.
+The plugin also reads the same value from `Oem/Hpe/FanPercentMinimum` and updates the Domoticz dimmer. The local plugin range is 0-100%, but iLO firmware may still reject values below the server's supported minimum.
 
 ### Thermal Configuration
 
