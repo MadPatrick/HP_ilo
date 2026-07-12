@@ -7,12 +7,18 @@ Version: 1.2.2
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
         version="1.2.2" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
-        <br/><h2>HP Integrated Lights-Out (iLO)</h2>
-        Version: 1.2.2<br/>
-        Reads sensor data from an HP iLO interface.
-        <br/><br/>
-        <h3>Parameters</h3>
-        Enter the connection details for your HP iLO interface below.
+        <h2>HP Integrated Lights-Out (iLO)</h2>
+        <p><strong>Version:</strong> 1.2.2</p>
+        <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
+        <h3>Features</h3>
+        <ul>
+            <li>Health, temperature, fan, power, memory, processor, storage and SSD lifetime sensors.</li>
+            <li>Server identification and firmware information.</li>
+            <li>Minimum fan speed and thermal configuration controls when supported by iLO.</li>
+            <li>Power Regulator mode control when supported by the server.</li>
+        </ul>
+        <h3>Configuration</h3>
+        <p>Enter the iLO hostname, HTTPS port and an account with access to the required Redfish resources.</p>
     </description>
     <params>
         <param field="Address"  label="IP Address / Hostname" width="200px" required="true" default="192.168.1.1"/>
