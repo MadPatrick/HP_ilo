@@ -187,6 +187,28 @@ class BasePlugin:
         self.min_fan_speed_supported = None
         self.thermal_config_supported = None
         self.power_regulator_supported = None
+        self.imageID = 0
+
+    def _load_device_icon(self):
+        creating_new_icon = "hpilo" not in Images
+        try:
+            Domoticz.Image("hpilo_icons.zip").Create()
+        except Exception as e:
+            Domoticz.Error("Unable to load icon pack 'hpilo_icons.zip': {}".format(e))
+            return
+        if "hpilo" in Images:
+            self.imageID = Images["hpilo"].ID
+            Domoticz.Log("Icons created and loaded." if creating_new_icon else
+                         "Icons found in database (ImageID={}).".format(self.imageID))
+        else:
+            Domoticz.Error("Unable to load icon pack 'hpilo_icons.zip'")
+
+    def _apply_device_icon(self):
+        if not self.imageID:
+            return
+        for device in Devices.values():
+            if device.Image != self.imageID:
+                device.Update(nValue=device.nValue, sValue=device.sValue, Image=self.imageID)
 
     def onStart(self):
         self.debug = Parameters["Mode6"] == "1"
@@ -200,11 +222,10 @@ class BasePlugin:
         self.heartbeats_per_poll = max(1, self.poll_interval // heartbeat_sec)
         Domoticz.Heartbeat(heartbeat_sec)
         Domoticz.Log("HP iLO Redfish plugin started")
-        if "hpilo" not in Images:
-            Domoticz.Image("hpilo_icons.zip").Create()
-            Domoticz.Log("Created custom icon: hpilo")
+        self._load_device_icon()
         self._delete_legacy_devices()
         self._create_devices()
+        self._apply_device_icon()
         self._connect_and_update()
 
     def onStop(self):
@@ -246,7 +267,6 @@ class BasePlugin:
                 Domoticz.Error("Unable to recreate SSD Lifetime device: {}".format(err))
 
     def _create_devices(self):
-        icon_id = Images["hpilo"].ID if "hpilo" in Images else 0
         for unit, name, type_num, subtype, options in SENSOR_DEFINITIONS:
             if unit not in Devices:
                 Domoticz.Device(
@@ -255,7 +275,7 @@ class BasePlugin:
                     Type=type_num,
                     Subtype=subtype,
                     Options=options,
-                    Image=icon_id,
+                    Image=self.imageID,
                     Used=1
                 ).Create()
                 Domoticz.Log("Created device: {}".format(name))
@@ -267,7 +287,7 @@ class BasePlugin:
                 Unit=UNIT_MIN_FAN_SPEED,
                 TypeName="Dimmer",
                 Switchtype=7,
-                Image=icon_id,
+                Image=self.imageID,
                 Used=1
             ).Create()
             Domoticz.Log("Created device: Minimum Fan Speed")
@@ -284,7 +304,7 @@ class BasePlugin:
                     "LevelOffHidden": "true",
                     "SelectorStyle": THERMAL_CONFIG_SELECTOR_STYLE
                 },
-                Image=icon_id,
+                Image=self.imageID,
                 Used=1
             ).Create()
             Domoticz.Log("Created device: Thermal Configuration")
@@ -301,7 +321,7 @@ class BasePlugin:
                     "LevelOffHidden": "true",
                     "SelectorStyle": POWER_REGULATOR_SELECTOR_STYLE
                 },
-                Image=icon_id,
+                Image=self.imageID,
                 Used=1
             ).Create()
             Domoticz.Log("Created device: Power Regulator")
