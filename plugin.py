@@ -195,6 +195,16 @@ class BasePlugin:
         self.power_regulator_supported = None
         self.imageID = 0
 
+    @property
+    def _devices(self):
+        """Safely access the Domoticz Devices global, returning an empty dict if unavailable."""
+        return globals().get('Devices', {})
+
+    def _get_device_svalue(self, unit):
+        """Return the sValue of a device unit, or None if unavailable."""
+        devices = self._devices
+        return getattr(devices.get(unit), 'sValue', None)
+
     def _load_device_icon(self):
         icon_name = "hpilo"
         existing_image = next(
@@ -355,44 +365,48 @@ class BasePlugin:
 
 
     def _update_min_fan_speed(self, percent):
-        if UNIT_MIN_FAN_SPEED not in Devices or percent is None:
+        devices = self._devices
+        if UNIT_MIN_FAN_SPEED not in devices or percent is None:
             return
         level = self._clamp_fan_percent(percent)
-        Devices[UNIT_MIN_FAN_SPEED].Update(nValue=2, sValue=str(level))
+        devices[UNIT_MIN_FAN_SPEED].Update(nValue=2, sValue=str(level))
         if self.debug:
             Domoticz.Log("Updated minimum fan speed = {}%".format(level))
 
     def _update_thermal_config(self, config):
-        if UNIT_THERMAL_CONFIG not in Devices or config is None:
+        devices = self._devices
+        if UNIT_THERMAL_CONFIG not in devices or config is None:
             return
         level = self._thermal_config_to_level(config)
         if level is None:
             if self.debug:
                 Domoticz.Log("Unknown thermal configuration value from iLO: {}".format(config))
             return
-        Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
+        devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
         if self.debug:
             Domoticz.Log("Updated thermal configuration = {}".format(config))
 
     def _update_power_regulator(self, value):
-        if UNIT_POWER_REGULATOR not in Devices or value is None:
+        devices = self._devices
+        if UNIT_POWER_REGULATOR not in devices or value is None:
             return
         level = self._power_regulator_to_level(value)
         if level is None:
             if self.debug:
                 Domoticz.Log("Unknown power regulator value from iLO: {}".format(value))
             return
-        Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
+        devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
         if self.debug:
             Domoticz.Log("Updated power regulator = {}".format(value))
 
     def _restore_power_regulator_level(self, level):
-        if UNIT_POWER_REGULATOR not in Devices or level is None:
+        devices = self._devices
+        if UNIT_POWER_REGULATOR not in devices or level is None:
             return
-        Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
+        devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(level))
 
     def _handle_min_fan_speed_command(self, Command, Level):
-        previous_level = Devices[UNIT_MIN_FAN_SPEED].sValue if UNIT_MIN_FAN_SPEED in Devices else None
+        previous_level = self._get_device_svalue(UNIT_MIN_FAN_SPEED)
         if self.min_fan_speed_supported is False:
             Domoticz.Log("This iLO does not expose writable minimum fan speed via Redfish; restoring previous level")
             self._update_min_fan_speed(previous_level)
@@ -427,7 +441,8 @@ class BasePlugin:
             self._connect_and_update()
 
     def _handle_thermal_config_command(self, Level):
-        previous_level = Devices[UNIT_THERMAL_CONFIG].sValue if UNIT_THERMAL_CONFIG in Devices else None
+        devices = self._devices
+        previous_level = self._get_device_svalue(UNIT_THERMAL_CONFIG)
         if self.thermal_config_supported is False:
             Domoticz.Log("This iLO does not expose writable thermal configuration via Redfish; restoring previous level")
             self._restore_thermal_config_level(previous_level)
@@ -451,7 +466,8 @@ class BasePlugin:
             try:
                 self._set_thermal_configuration(rf, config)
                 self.thermal_config_supported = True
-                Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
+                if UNIT_THERMAL_CONFIG in devices:  # Devices may be absent in some onCommand contexts
+                    devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
                 return
             finally:
@@ -466,7 +482,8 @@ class BasePlugin:
             self._connect_and_update()
 
     def _handle_power_regulator_command(self, Level):
-        previous_level = Devices[UNIT_POWER_REGULATOR].sValue if UNIT_POWER_REGULATOR in Devices else None
+        devices = self._devices
+        previous_level = self._get_device_svalue(UNIT_POWER_REGULATOR)
         if self.power_regulator_supported is False:
             Domoticz.Log("This iLO does not expose writable power regulator via Redfish; restoring previous level")
             self._restore_power_regulator_level(previous_level)
@@ -490,7 +507,8 @@ class BasePlugin:
             try:
                 self._set_power_regulator(rf, value)
                 self.power_regulator_supported = True
-                Devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
+                if UNIT_POWER_REGULATOR in devices:  # Devices may be absent in some onCommand contexts
+                    devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
             finally:
                 rf.logout()
@@ -504,9 +522,10 @@ class BasePlugin:
             self._connect_and_update()
 
     def _restore_thermal_config_level(self, level):
-        if UNIT_THERMAL_CONFIG not in Devices or level is None:
+        devices = self._devices
+        if UNIT_THERMAL_CONFIG not in devices or level is None:
             return
-        Devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
+        devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(level))
 
     def _clamp_fan_percent(self, value):
         try:
