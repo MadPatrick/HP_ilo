@@ -2,13 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.2
+Version: 1.2.3
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.2" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.3" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <h2>HP Integrated Lights-Out (iLO)</h2>
-        <p><strong>Version:</strong> 1.2.2</p>
+        <p><strong>Version:</strong> 1.2.3</p>
         <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
         <h3>Features</h3>
         <ul>
@@ -196,16 +196,30 @@ class BasePlugin:
         self.imageID = 0
 
     def _load_device_icon(self):
-        creating_new_icon = "hpilo" not in Images
+        icon_name = "hpilo"
+        existing_image = next(
+            (image for name, image in Images.items()
+             if str(name).casefold() == icon_name.casefold()),
+            None,
+        )
+        if existing_image is not None:
+            self.imageID = existing_image.ID
+            Domoticz.Log("Icons found in database (ImageID={}).".format(self.imageID))
+            return
+
         try:
             Domoticz.Image("hpilo_icons.zip").Create()
         except Exception as e:
             Domoticz.Error("Unable to load icon pack 'hpilo_icons.zip': {}".format(e))
             return
-        if "hpilo" in Images:
-            self.imageID = Images["hpilo"].ID
-            Domoticz.Log("Icons created and loaded." if creating_new_icon else
-                         "Icons found in database (ImageID={}).".format(self.imageID))
+        created_image = next(
+            (image for name, image in Images.items()
+             if str(name).casefold() == icon_name.casefold()),
+            None,
+        )
+        if created_image is not None:
+            self.imageID = created_image.ID
+            Domoticz.Log("Icons created and loaded.")
         else:
             Domoticz.Error("Unable to load icon pack 'hpilo_icons.zip'")
 
