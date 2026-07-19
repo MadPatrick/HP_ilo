@@ -203,7 +203,7 @@ class BasePlugin:
     def _get_device_svalue(self, unit):
         """Return the sValue of a device unit, or None if unavailable."""
         devices = self._devices
-        return devices[unit].sValue if unit in devices else None
+        return getattr(devices.get(unit), 'sValue', None)
 
     def _load_device_icon(self):
         icon_name = "hpilo"
@@ -466,7 +466,7 @@ class BasePlugin:
             try:
                 self._set_thermal_configuration(rf, config)
                 self.thermal_config_supported = True
-                if UNIT_THERMAL_CONFIG in devices:
+                if UNIT_THERMAL_CONFIG in devices:  # Devices may be absent in some onCommand contexts
                     devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
                 return
@@ -507,7 +507,7 @@ class BasePlugin:
             try:
                 self._set_power_regulator(rf, value)
                 self.power_regulator_supported = True
-                if UNIT_POWER_REGULATOR in devices:
+                if UNIT_POWER_REGULATOR in devices:  # Devices may be absent in some onCommand contexts
                     devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
             finally:
