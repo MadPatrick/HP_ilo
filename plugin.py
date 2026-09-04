@@ -2,13 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.3
+Version: 1.2.4
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.3" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.4" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <h2>HP Integrated Lights-Out (iLO)</h2>
-        <p><strong>Version:</strong> 1.2.3</p>
+        <p><strong>Version:</strong> 1.2.4</p>
         <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
         <h3>Features</h3>
         <ul>
@@ -26,6 +26,7 @@ Version: 1.2.3
         <param field="Username" label="Username"              width="150px" required="true" default="Administrator"/>
         <param field="Password" label="Password"              width="150px" required="true" default="" password="true"/>
         <param field="Mode1"    label="Poll interval (sec)"   width="75px"  required="true" default="300"/>
+        <param field="Mode2"    label="CA Certificate Path (optional, leave empty to disable verification)" width="300px" required="false" default=""/>
         <param field="Mode6"    label="Debug"                 width="100px">
             <options>
                 <option label="Off" value="0" default="true"/>
@@ -40,6 +41,7 @@ import Domoticz
 import urllib3
 import redfish
 import json
+from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -125,13 +127,19 @@ SENSOR_DEFINITIONS = [
 # --- Redfish Helper ---
 
 class RedfishILO:
-    def __init__(self, host, username, password, port=443):
+    # Connect/read timeout (seconds) for the underlying Redfish HTTP client. Without
+    # this, an unreachable iLO can block Domoticz's single callback thread indefinitely.
+    CONNECT_TIMEOUT = 10
+
+    def __init__(self, host, username, password, port=443, ca_cert=None):
         self.base_url = "https://{}:{}".format(host, port)
         self.client = redfish.redfish_client(
             base_url=self.base_url,
             username=username,
             password=password,
-            default_prefix="/redfish/v1"
+            default_prefix="/redfish/v1",
+            timeout=self.CONNECT_TIMEOUT,
+            cafile=ca_cert if ca_cert else None
         )
         self.client.login(auth="session")
 
@@ -193,12 +201,52 @@ class BasePlugin:
         self.min_fan_speed_supported = None
         self.thermal_config_supported = None
         self.power_regulator_supported = None
+        # Cooldown timestamps: once a feature is marked unsupported after a total
+        # PATCH failure, retry detection again after this time elapses instead of
+        # disabling it for the rest of the plugin's process lifetime (a single
+        # transient/network failure should not permanently silence a real feature).
+        self.min_fan_speed_retry_after = None
+        self.thermal_config_retry_after = None
+        self.power_regulator_retry_after = None
         self.imageID = 0
 
     @property
     def _devices(self):
         """Safely access the Domoticz Devices global, returning an empty dict if unavailable."""
         return globals().get('Devices', {})
+
+    def _get_ca_cert_path(self):
+        """Return the user-configured CA certificate path (Mode2), or None if unset.
+
+        Leaving this empty preserves today's behaviour exactly (no certificate
+        verification, InsecureRequestWarning suppressed). Providing a path opts
+        into verifying the iLO's certificate against it.
+        """
+        value = Parameters.get("Mode2", "").strip()
+        return value or None
+
+    def _feature_blocked(self, supported_attr, retry_attr):
+        """Return True if a control feature is currently known-unsupported and still
+        within its retry cooldown. If the cooldown has elapsed, reset the feature's
+        state to unknown so the next attempt re-probes the iLO instead of leaving it
+        disabled forever.
+        """
+        if getattr(self, supported_attr) is False:
+            retry_after = getattr(self, retry_attr)
+            if retry_after is not None and datetime.now() >= retry_after:
+                setattr(self, supported_attr, None)
+                setattr(self, retry_attr, None)
+                return False
+            return True
+        return False
+
+    def _mark_feature_unsupported(self, supported_attr, retry_attr):
+        """Mark a control feature unsupported for a cooldown period (currently 1
+        hour) rather than permanently, so a genuine 'not supported' iLO response
+        is only silenced temporarily and transient failures self-heal.
+        """
+        setattr(self, supported_attr, False)
+        setattr(self, retry_attr, datetime.now() + timedelta(hours=1))
 
     def _get_device_svalue(self, unit):
         """Return the sValue of a device unit, or None if unavailable."""
@@ -407,7 +455,7 @@ class BasePlugin:
 
     def _handle_min_fan_speed_command(self, Command, Level):
         previous_level = self._get_device_svalue(UNIT_MIN_FAN_SPEED)
-        if self.min_fan_speed_supported is False:
+        if self._feature_blocked("min_fan_speed_supported", "min_fan_speed_retry_after"):
             Domoticz.Log("This iLO does not expose writable minimum fan speed via Redfish; restoring previous level")
             self._update_min_fan_speed(previous_level)
             self._connect_and_update()
@@ -422,18 +470,20 @@ class BasePlugin:
                 host=Parameters["Address"],
                 username=Parameters["Username"],
                 password=Parameters["Password"],
-                port=int(Parameters["Port"])
+                port=int(Parameters["Port"]),
+                ca_cert=self._get_ca_cert_path()
             )
             try:
                 self._set_min_fan_speed_percent(rf, percent)
                 self.min_fan_speed_supported = True
+                self.min_fan_speed_retry_after = None
                 self._update_min_fan_speed(percent)
                 self._fetch_and_push(rf)
             finally:
                 rf.logout()
         except Exception as err:
             if self._is_fan_control_not_writable(err):
-                self.min_fan_speed_supported = False
+                self._mark_feature_unsupported("min_fan_speed_supported", "min_fan_speed_retry_after")
                 Domoticz.Error("iLO minimum fan speed is read-only or not exposed through this Redfish path")
             else:
                 Domoticz.Error("Unable to set iLO minimum fan speed: {}".format(err))
@@ -443,7 +493,7 @@ class BasePlugin:
     def _handle_thermal_config_command(self, Level):
         devices = self._devices
         previous_level = self._get_device_svalue(UNIT_THERMAL_CONFIG)
-        if self.thermal_config_supported is False:
+        if self._feature_blocked("thermal_config_supported", "thermal_config_retry_after"):
             Domoticz.Log("This iLO does not expose writable thermal configuration via Redfish; restoring previous level")
             self._restore_thermal_config_level(previous_level)
             self._connect_and_update()
@@ -461,11 +511,13 @@ class BasePlugin:
                 host=Parameters["Address"],
                 username=Parameters["Username"],
                 password=Parameters["Password"],
-                port=int(Parameters["Port"])
+                port=int(Parameters["Port"]),
+                ca_cert=self._get_ca_cert_path()
             )
             try:
                 self._set_thermal_configuration(rf, config)
                 self.thermal_config_supported = True
+                self.thermal_config_retry_after = None
                 if UNIT_THERMAL_CONFIG in devices:  # Devices may be absent in some onCommand contexts
                     devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
@@ -474,7 +526,7 @@ class BasePlugin:
                 rf.logout()
         except Exception as err:
             if self._is_fan_control_not_writable(err):
-                self.thermal_config_supported = False
+                self._mark_feature_unsupported("thermal_config_supported", "thermal_config_retry_after")
                 Domoticz.Error("iLO thermal configuration is read-only or not exposed through this Redfish path")
             else:
                 Domoticz.Error("Unable to set iLO thermal configuration: {}".format(err))
@@ -484,7 +536,7 @@ class BasePlugin:
     def _handle_power_regulator_command(self, Level):
         devices = self._devices
         previous_level = self._get_device_svalue(UNIT_POWER_REGULATOR)
-        if self.power_regulator_supported is False:
+        if self._feature_blocked("power_regulator_supported", "power_regulator_retry_after"):
             Domoticz.Log("This iLO does not expose writable power regulator via Redfish; restoring previous level")
             self._restore_power_regulator_level(previous_level)
             self._connect_and_update()
@@ -502,11 +554,13 @@ class BasePlugin:
                 host=Parameters["Address"],
                 username=Parameters["Username"],
                 password=Parameters["Password"],
-                port=int(Parameters["Port"])
+                port=int(Parameters["Port"]),
+                ca_cert=self._get_ca_cert_path()
             )
             try:
                 self._set_power_regulator(rf, value)
                 self.power_regulator_supported = True
+                self.power_regulator_retry_after = None
                 if UNIT_POWER_REGULATOR in devices:  # Devices may be absent in some onCommand contexts
                     devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
                 Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
@@ -514,7 +568,7 @@ class BasePlugin:
                 rf.logout()
         except Exception as err:
             if self._is_fan_control_not_writable(err):
-                self.power_regulator_supported = False
+                self._mark_feature_unsupported("power_regulator_supported", "power_regulator_retry_after")
                 Domoticz.Error("iLO power regulator is read-only or not exposed through this Redfish path")
             else:
                 Domoticz.Error("Unable to set iLO power regulator: {}".format(err))
@@ -540,7 +594,8 @@ class BasePlugin:
                 host=Parameters["Address"],
                 username=Parameters["Username"],
                 password=Parameters["Password"],
-                port=int(Parameters["Port"])
+                port=int(Parameters["Port"]),
+                ca_cert=self._get_ca_cert_path()
             )
             try:
                 self._fetch_and_push(rf)
