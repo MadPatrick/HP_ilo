@@ -2,13 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.4
+Version: 1.2.6
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.4" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.6" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <h2>HP Integrated Lights-Out (iLO)</h2>
-        <p><strong>Version:</strong> 1.2.4</p>
+        <p><strong>Version:</strong> 1.2.6</p>
         <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
         <h3>Features</h3>
         <ul>
@@ -41,6 +41,8 @@ import Domoticz
 import urllib3
 import redfish
 import json
+import threading
+import queue
 from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -114,7 +116,7 @@ SENSOR_DEFINITIONS = [
     (UNIT_SERVER_NAME, "Server Name",       243, 19, {}),
     (UNIT_POWER_STATE, "Power State",       243, 19, {}),
     (UNIT_HEALTH,      "Health",            243, 22, {}),
-    (UNIT_SSD_LIFETIME, "SSD Lifetime",      243,  6, {}),
+    (UNIT_SSD_LIFETIME, "SSD Lifetime",      243,  6, {"Migrated": "1"}),
     (UNIT_CPU_TEMP,    "CPU Temperature",    80,  5, {"Custom": "1;C"}),
     (UNIT_INLET_TEMP,  "Inlet Temperature",  80,  5, {"Custom": "1;C"}),
     (UNIT_FIRMWARE,    "iLO Firmware",      243, 19, {}),
@@ -193,6 +195,11 @@ class RedfishILO:
 # --- Plugin ---
 
 class BasePlugin:
+    # Force a fresh Redfish login after this long, conservatively under a
+    # typical iLO session-idle timeout, so a stale/invalidated session cannot
+    # silently stop updating forever between age-based refreshes.
+    SESSION_MAX_AGE = timedelta(minutes=25)
+
     def __init__(self):
         self.debug               = False
         self.poll_interval       = 300
@@ -209,6 +216,23 @@ class BasePlugin:
         self.thermal_config_retry_after = None
         self.power_regulator_retry_after = None
         self.imageID = 0
+
+        # Persistent Redfish session, reused across heartbeats/commands instead
+        # of logging into iLO fresh on every single call. Access is serialized
+        # through _redfish_lock since it's shared between the heartbeat worker
+        # thread and onCommand (main thread).
+        self._rf = None
+        self._rf_created_at = None
+        self._redfish_lock = threading.Lock()
+
+        # The heartbeat's Redfish fetch runs on a background thread so a
+        # slow/unreachable iLO never blocks Domoticz's single callback thread.
+        # The worker only calls rf.get(...) (via _gather_all_sections, which
+        # never touches Devices[...]); onHeartbeat performs all Devices[...]
+        # updates on the main thread via _apply_all_sections().
+        self._fetch_lock = threading.Lock()
+        self._fetch_in_progress = False
+        self._result_queue = queue.Queue()
 
     @property
     def _devices(self):
@@ -252,6 +276,63 @@ class BasePlugin:
         """Return the sValue of a device unit, or None if unavailable."""
         devices = self._devices
         return getattr(devices.get(unit), 'sValue', None)
+
+    def _health_nvalue(self, health):
+        """Map a Redfish Status.Health value to a Domoticz alert nValue,
+        keeping Warning (3, orange) distinct from Critical (4, red) instead of
+        collapsing every non-OK status to the same alarm level."""
+        normalized = str(health).strip().upper()
+        if normalized == "OK":
+            return 1
+        if normalized == "CRITICAL":
+            return 4
+        if normalized == "WARNING":
+            return 3
+        # Unrecognized/unset status: flag it as a warning rather than silently
+        # treating it as OK, but distinguishable from a confirmed Critical.
+        return 3
+
+    def _get_redfish_client(self, force_new=False):
+        """Returns the persistent Redfish session, creating (or refreshing) it
+        as needed. Must only be called while holding self._redfish_lock."""
+        now = datetime.now()
+        if not force_new and self._rf is not None and self._rf_created_at is not None:
+            if now - self._rf_created_at >= self.SESSION_MAX_AGE:
+                force_new = True
+
+        if force_new and self._rf is not None:
+            try:
+                self._rf.logout()
+            except Exception:
+                pass
+            self._rf = None
+
+        if self._rf is None:
+            self._rf = RedfishILO(
+                host=Parameters["Address"],
+                username=Parameters["Username"],
+                password=Parameters["Password"],
+                port=int(Parameters["Port"]),
+                ca_cert=self._get_ca_cert_path()
+            )
+            self._rf_created_at = now
+        return self._rf
+
+    def _with_redfish(self, action):
+        """Runs `action(rf)` using the persistent Redfish session (serialized
+        through self._redfish_lock, since it's shared between the heartbeat
+        worker thread and onCommand), reconnecting and retrying once if the
+        call fails - e.g. the session expired - instead of tearing down and
+        creating a brand new iLO session on every single call."""
+        with self._redfish_lock:
+            rf = self._get_redfish_client()
+            try:
+                return action(rf)
+            except Exception as first_err:
+                if self.debug:
+                    Domoticz.Log("Redfish call failed, reconnecting once: {}".format(first_err))
+                rf = self._get_redfish_client(force_new=True)
+                return action(rf)
 
     def _load_device_icon(self):
         icon_name = "hpilo"
@@ -307,9 +388,28 @@ class BasePlugin:
         self._connect_and_update()
 
     def onStop(self):
+        with self._redfish_lock:
+            if self._rf is not None:
+                try:
+                    self._rf.logout()
+                except Exception:
+                    pass
+                self._rf = None
         Domoticz.Log("Plugin stopped")
 
     def onHeartbeat(self):
+        # Process any fetch cycle the background worker finished since the
+        # last tick - main/callback thread, safe here to touch Devices[...].
+        while True:
+            try:
+                status, payload = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if status == "error":
+                Domoticz.Error("Redfish connection error: {}".format(payload))
+            else:
+                self._apply_all_sections(payload)
+
         self.heartbeat_count += 1
         if self.heartbeat_count >= self.heartbeats_per_poll:
             self.heartbeat_count = 0
@@ -338,7 +438,13 @@ class BasePlugin:
 
         if UNIT_SSD_LIFETIME in Devices:
             try:
-                if Devices[UNIT_SSD_LIFETIME].Name != "SSD Lifetime":
+                # Checks a marker in Options rather than Name/TypeName: Name is
+                # freely user-editable in the Domoticz UI, so comparing against
+                # a fixed string here would re-trigger this migration (and wipe
+                # any custom name) on every single restart for anyone who ever
+                # renamed the device - this migration should run at most once.
+                options = getattr(Devices[UNIT_SSD_LIFETIME], "Options", {}) or {}
+                if options.get("Migrated") != "1":
                     Devices[UNIT_SSD_LIFETIME].Delete()
                     Domoticz.Log("Recreated unit 4 as SSD Lifetime")
             except Exception as err:
@@ -465,22 +571,15 @@ class BasePlugin:
         percent = self._clamp_fan_percent(percent)
         Domoticz.Log("Setting iLO minimum fan speed to {}%".format(percent))
 
+        def _do(rf):
+            self._set_min_fan_speed_percent(rf, percent)
+            self.min_fan_speed_supported = True
+            self.min_fan_speed_retry_after = None
+            self._update_min_fan_speed(percent)
+            self._fetch_and_push(rf)
+
         try:
-            rf = RedfishILO(
-                host=Parameters["Address"],
-                username=Parameters["Username"],
-                password=Parameters["Password"],
-                port=int(Parameters["Port"]),
-                ca_cert=self._get_ca_cert_path()
-            )
-            try:
-                self._set_min_fan_speed_percent(rf, percent)
-                self.min_fan_speed_supported = True
-                self.min_fan_speed_retry_after = None
-                self._update_min_fan_speed(percent)
-                self._fetch_and_push(rf)
-            finally:
-                rf.logout()
+            self._with_redfish(_do)
         except Exception as err:
             if self._is_fan_control_not_writable(err):
                 self._mark_feature_unsupported("min_fan_speed_supported", "min_fan_speed_retry_after")
@@ -506,24 +605,17 @@ class BasePlugin:
 
         Domoticz.Log("Setting iLO thermal configuration to {}".format(config))
 
+        def _do(rf):
+            self._set_thermal_configuration(rf, config)
+            self.thermal_config_supported = True
+            self.thermal_config_retry_after = None
+            if UNIT_THERMAL_CONFIG in devices:  # Devices may be absent in some onCommand contexts
+                devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
+            Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
+
         try:
-            rf = RedfishILO(
-                host=Parameters["Address"],
-                username=Parameters["Username"],
-                password=Parameters["Password"],
-                port=int(Parameters["Port"]),
-                ca_cert=self._get_ca_cert_path()
-            )
-            try:
-                self._set_thermal_configuration(rf, config)
-                self.thermal_config_supported = True
-                self.thermal_config_retry_after = None
-                if UNIT_THERMAL_CONFIG in devices:  # Devices may be absent in some onCommand contexts
-                    devices[UNIT_THERMAL_CONFIG].Update(nValue=1, sValue=str(Level))
-                Domoticz.Log("Thermal configuration accepted; skipping immediate refresh because iLO may restart")
-                return
-            finally:
-                rf.logout()
+            self._with_redfish(_do)
+            return
         except Exception as err:
             if self._is_fan_control_not_writable(err):
                 self._mark_feature_unsupported("thermal_config_supported", "thermal_config_retry_after")
@@ -549,23 +641,16 @@ class BasePlugin:
 
         Domoticz.Log("Setting iLO power regulator to {}".format(value))
 
+        def _do(rf):
+            self._set_power_regulator(rf, value)
+            self.power_regulator_supported = True
+            self.power_regulator_retry_after = None
+            if UNIT_POWER_REGULATOR in devices:  # Devices may be absent in some onCommand contexts
+                devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
+            Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
+
         try:
-            rf = RedfishILO(
-                host=Parameters["Address"],
-                username=Parameters["Username"],
-                password=Parameters["Password"],
-                port=int(Parameters["Port"]),
-                ca_cert=self._get_ca_cert_path()
-            )
-            try:
-                self._set_power_regulator(rf, value)
-                self.power_regulator_supported = True
-                self.power_regulator_retry_after = None
-                if UNIT_POWER_REGULATOR in devices:  # Devices may be absent in some onCommand contexts
-                    devices[UNIT_POWER_REGULATOR].Update(nValue=1, sValue=str(Level))
-                Domoticz.Log("Power regulator accepted; a server reboot may be required before it becomes active")
-            finally:
-                rf.logout()
+            self._with_redfish(_do)
         except Exception as err:
             if self._is_fan_control_not_writable(err):
                 self._mark_feature_unsupported("power_regulator_supported", "power_regulator_retry_after")
@@ -589,20 +674,31 @@ class BasePlugin:
         return max(MIN_FAN_PERCENT, min(MAX_FAN_PERCENT, percent))
 
     def _connect_and_update(self):
+        """Starts the background worker for one Redfish refresh cycle. Runs on
+        the main thread; only starts a thread and returns immediately."""
+        with self._fetch_lock:
+            if self._fetch_in_progress:
+                if self.debug:
+                    Domoticz.Log("Redfish fetch already in progress, skipping this heartbeat trigger.")
+                return
+            self._fetch_in_progress = True
+
+        threading.Thread(target=self._fetchWorker, daemon=True).start()
+
+    def _fetchWorker(self):
+        """Runs on a background thread. Uses the persistent Redfish session to
+        gather all sensor data (_gather_all_sections never touches Devices[...])
+        and hands the result back through self._result_queue. Devices[...]
+        updates happen in _apply_all_sections(), on the main thread, from
+        onHeartbeat."""
         try:
-            rf = RedfishILO(
-                host=Parameters["Address"],
-                username=Parameters["Username"],
-                password=Parameters["Password"],
-                port=int(Parameters["Port"]),
-                ca_cert=self._get_ca_cert_path()
-            )
-            try:
-                self._fetch_and_push(rf)
-            finally:
-                rf.logout()
+            bundle = self._with_redfish(self._gather_all_sections)
+            self._result_queue.put(("ok", bundle))
         except Exception as err:
-            Domoticz.Error("Redfish connection error: {}".format(err))
+            self._result_queue.put(("error", str(err)))
+        finally:
+            with self._fetch_lock:
+                self._fetch_in_progress = False
 
     def _get_hpe_oem(self, data):
         oem = data.get("Oem", {})
@@ -838,6 +934,22 @@ class BasePlugin:
 
 
     def _fetch_and_push(self, rf):
+        """Synchronous convenience wrapper (gather + apply on the same thread) -
+        used by onCommand handlers, where a blocking refresh right after a
+        successful PATCH is consistent with the rest of onCommand already
+        being synchronous. The heartbeat path uses the async split below
+        (_gather_all_sections on a worker thread, _apply_all_sections on the
+        main thread) instead."""
+        bundle = self._gather_all_sections(rf)
+        self._apply_all_sections(bundle)
+
+    def _gather_all_sections(self, rf):
+        """Runs on a background thread (via _with_redfish/_fetchWorker) or,
+        for onCommand, synchronously on the main thread. Does ONLY the
+        blocking rf.get(...) calls for each section, preserving the original
+        per-section error isolation, and returns a bundle of raw data. Never
+        touches Devices[...] - that happens afterwards in
+        _apply_all_sections()."""
         root = rf.get("/redfish/v1/")
         systems_path  = root.get("Systems",  {}).get("@odata.id", "/redfish/v1/Systems")
         chassis_path  = root.get("Chassis",  {}).get("@odata.id", "/redfish/v1/Chassis")
@@ -848,7 +960,9 @@ class BasePlugin:
             Domoticz.Log("Chassis:  {}".format(chassis_path))
             Domoticz.Log("Managers: {}".format(managers_path))
 
+        bundle = {}
         system_uri = None
+
         # System
         try:
             system_uri  = self._get_first_member_uri(rf, systems_path)
@@ -856,35 +970,28 @@ class BasePlugin:
             model       = system.get("Model",        "Unknown")
             bios        = system.get("BiosVersion",  "")
             model_str   = "{} | BIOS: {}".format(model, bios) if bios else model
-            health      = system.get("Status", {}).get("Health", "Unknown")
-
-            self._update_device(UNIT_SERVER_NAME, system.get("HostName",     "Unknown"))
-            self._update_device(UNIT_POWER_STATE, system.get("PowerState",   "Unknown"))
-            self._update_device(UNIT_SERIAL,      system.get("SerialNumber", "Unknown"))
-            self._update_device(UNIT_MODEL,       model_str)
-
-            if str(health).upper() == "OK":
-                Devices[UNIT_HEALTH].Update(nValue=1, sValue="All OK")
-            else:
-                Devices[UNIT_HEALTH].Update(nValue=4, sValue=str(health))
+            bundle["system"] = {
+                "hostname":     system.get("HostName", "Unknown"),
+                "power_state":  system.get("PowerState", "Unknown"),
+                "serial":       system.get("SerialNumber", "Unknown"),
+                "model_str":    model_str,
+                "health":       system.get("Status", {}).get("Health", "Unknown"),
+            }
         except Exception as err:
-            Domoticz.Error("System error: {}".format(err))
+            bundle["system_error"] = str(err)
 
         # Power Regulator
         try:
             if system_uri is None:
                 system_uri = self._get_first_member_uri(rf, systems_path)
             bios = rf.get(system_uri.rstrip("/") + "/Bios")
-            self._update_power_regulator(self._get_bios_attribute_value(bios, POWER_REGULATOR_KEYS))
+            bundle["power_regulator_value"] = self._get_bios_attribute_value(bios, POWER_REGULATOR_KEYS)
         except Exception as err:
-            if self.debug:
-                Domoticz.Log("Power regulator read error: {}".format(err))
+            bundle["power_regulator_error"] = str(err)
 
         # Thermal
         try:
-            thermal     = rf.get(self._get_first_member_uri(rf, chassis_path) + "/Thermal")
-            self._update_min_fan_speed(self._get_thermal_setting_value(thermal, MIN_FAN_SETTING_KEYS))
-            self._update_thermal_config(self._get_thermal_setting_value(thermal, THERMAL_CONFIG_KEYS))
+            thermal = rf.get(self._get_first_member_uri(rf, chassis_path) + "/Thermal")
 
             cpu_temp   = None
             inlet_temp = None
@@ -900,20 +1007,21 @@ class BasePlugin:
                 elif "inlet" in name and "board" not in name and inlet_temp is None:
                     inlet_temp = reading
 
-            if cpu_temp is not None:
-                self._update_device(UNIT_CPU_TEMP, cpu_temp)
-            if inlet_temp is not None:
-                self._update_device(UNIT_INLET_TEMP, inlet_temp)
+            bundle["thermal"] = {
+                "min_fan_setting":        self._get_thermal_setting_value(thermal, MIN_FAN_SETTING_KEYS),
+                "thermal_config_setting": self._get_thermal_setting_value(thermal, THERMAL_CONFIG_KEYS),
+                "cpu_temp":               cpu_temp,
+                "inlet_temp":             inlet_temp,
+            }
         except Exception as err:
-            Domoticz.Error("Thermal error: {}".format(err))
+            bundle["thermal_error"] = str(err)
 
         # Firmware
         try:
-            manager  = rf.get(self._get_first_member_uri(rf, managers_path))
-            firmware = manager.get("FirmwareVersion", "Unknown")
-            self._update_device(UNIT_FIRMWARE, firmware)
+            manager = rf.get(self._get_first_member_uri(rf, managers_path))
+            bundle["firmware"] = manager.get("FirmwareVersion", "Unknown")
         except Exception as err:
-            Domoticz.Error("Firmware error: {}".format(err))
+            bundle["firmware_error"] = str(err)
 
         # Network
         try:
@@ -922,9 +1030,9 @@ class BasePlugin:
             ipv4        = eth.get("IPv4Addresses", [])
             ip          = ipv4[0].get("Address", "N/A") if ipv4 else "N/A"
             mac         = eth.get("MACAddress", "N/A")
-            self._update_device(UNIT_NETWORK, "IP: {} | MAC: {}".format(ip, mac))
+            bundle["network"] = "IP: {} | MAC: {}".format(ip, mac)
         except Exception as err:
-            Domoticz.Error("Network error: {}".format(err))
+            bundle["network_error"] = str(err)
 
         # Storage
         try:
@@ -932,9 +1040,8 @@ class BasePlugin:
                 system_uri = self._get_first_member_uri(rf, systems_path)
             storage_path = system_uri.rstrip("/") + "/Storage"
             storage      = rf.get(storage_path)
-            drives       = []
+            drives        = []
             ssd_lifetimes = []
-            any_bad      = False
 
             for member in storage.get("Members", []):
                 uri = member.get("@odata.id")
@@ -951,7 +1058,7 @@ class BasePlugin:
                         capacity    = drive.get("CapacityBytes", 0)
                         capacity_gb = round(capacity / 1e9, 1) if capacity else 0
                         media       = drive.get("MediaType", "Unknown")
-                        lifetime   = self._get_drive_lifetime_percent(drive)
+                        lifetime    = self._get_drive_lifetime_percent(drive)
                         if lifetime is not None and str(media).lower() in ("ssd", "solidstate", "solid state drive"):
                             ssd_lifetimes.append(lifetime)
                         drives.append({
@@ -959,14 +1066,13 @@ class BasePlugin:
                             "media":  media,
                             "health": health
                         })
-                        if str(health).upper() != "OK":
-                            any_bad = True
                     except Exception:
                         pass
 
+            fallback_controllers = None
             if not drives:
                 # iLO 4 fallback: no individual drive data, check controller health only
-                bad, ok = [], []
+                fallback_controllers = []
                 for member in storage.get("Members", []):
                     uri = member.get("@odata.id")
                     if not uri:
@@ -975,32 +1081,107 @@ class BasePlugin:
                         ctrl   = rf.get(uri)
                         name   = ctrl.get("Name", "Controller")
                         status = ctrl.get("Status", {}).get("Health", "Unknown")
-                        if str(status).upper() != "OK":
-                            bad.append("{}: {}".format(name, status))
-                        else:
-                            ok.append(name)
+                        fallback_controllers.append({"name": name, "status": status})
                     except Exception:
                         pass
+
+            bundle["storage"] = {
+                "drives":               drives,
+                "fallback_controllers": fallback_controllers,
+                "ssd_lifetimes":        ssd_lifetimes,
+            }
+        except Exception as err:
+            bundle["storage_error"] = str(err)
+
+        return bundle
+
+    def _apply_all_sections(self, bundle):
+        """Devices[...]-touching part of one refresh cycle, given the raw data
+        already fetched by _gather_all_sections(). Safe to call from the main
+        thread only."""
+        # System
+        if "system" in bundle:
+            s = bundle["system"]
+            self._update_device(UNIT_SERVER_NAME, s["hostname"])
+            self._update_device(UNIT_POWER_STATE, s["power_state"])
+            self._update_device(UNIT_SERIAL, s["serial"])
+            self._update_device(UNIT_MODEL, s["model_str"])
+            health = s["health"]
+            if str(health).upper() == "OK":
+                Devices[UNIT_HEALTH].Update(nValue=1, sValue="All OK")
+            else:
+                Devices[UNIT_HEALTH].Update(nValue=self._health_nvalue(health), sValue=str(health))
+        elif "system_error" in bundle:
+            Domoticz.Error("System error: {}".format(bundle["system_error"]))
+
+        # Power Regulator
+        if "power_regulator_value" in bundle:
+            self._update_power_regulator(bundle["power_regulator_value"])
+        elif "power_regulator_error" in bundle and self.debug:
+            Domoticz.Log("Power regulator read error: {}".format(bundle["power_regulator_error"]))
+
+        # Thermal
+        if "thermal" in bundle:
+            t = bundle["thermal"]
+            self._update_min_fan_speed(t["min_fan_setting"])
+            self._update_thermal_config(t["thermal_config_setting"])
+            if t["cpu_temp"] is not None:
+                self._update_device(UNIT_CPU_TEMP, t["cpu_temp"])
+            if t["inlet_temp"] is not None:
+                self._update_device(UNIT_INLET_TEMP, t["inlet_temp"])
+        elif "thermal_error" in bundle:
+            Domoticz.Error("Thermal error: {}".format(bundle["thermal_error"]))
+
+        # Firmware
+        if "firmware" in bundle:
+            self._update_device(UNIT_FIRMWARE, bundle["firmware"])
+        elif "firmware_error" in bundle:
+            Domoticz.Error("Firmware error: {}".format(bundle["firmware_error"]))
+
+        # Network
+        if "network" in bundle:
+            self._update_device(UNIT_NETWORK, bundle["network"])
+        elif "network_error" in bundle:
+            Domoticz.Error("Network error: {}".format(bundle["network_error"]))
+
+        # Storage
+        if "storage" in bundle:
+            st = bundle["storage"]
+            drives = st["drives"]
+            fallback_controllers = st["fallback_controllers"]
+            ssd_lifetimes = st["ssd_lifetimes"]
+
+            if not drives:
+                bad, ok = [], []
+                worst_nvalue = 1
+                for ctrl in (fallback_controllers or []):
+                    status = ctrl["status"]
+                    if str(status).upper() != "OK":
+                        bad.append("{}: {}".format(ctrl["name"], status))
+                        worst_nvalue = max(worst_nvalue, self._health_nvalue(status))
+                    else:
+                        ok.append(ctrl["name"])
                 if bad:
-                    Devices[UNIT_STORAGE].Update(nValue=4, sValue=" | ".join(bad))
+                    Devices[UNIT_STORAGE].Update(nValue=worst_nvalue, sValue=" | ".join(bad))
                 elif ok:
                     Devices[UNIT_STORAGE].Update(nValue=1, sValue="OK: {}".format(", ".join(ok)))
                 else:
                     Devices[UNIT_STORAGE].Update(nValue=0, sValue="No storage data")
             else:
                 parts = []
+                worst_nvalue = 1
                 for i, d in enumerate(drives, 1):
                     parts.append("Storage {}: {} | {} | {} GB".format(
                         i, d["health"], d["media"], d["gb"]
                     ))
+                    worst_nvalue = max(worst_nvalue, self._health_nvalue(d["health"]))
                 sValue = "\n".join(parts)
-                nValue = 4 if any_bad else 1
-                Devices[UNIT_STORAGE].Update(nValue=nValue, sValue=sValue)
+                Devices[UNIT_STORAGE].Update(nValue=worst_nvalue, sValue=sValue)
 
             if ssd_lifetimes:
                 self._update_ssd_lifetime(min(ssd_lifetimes))
-
-        except Exception as err:
+        elif "storage_error" in bundle:
+            err = bundle["storage_error"]
             if "404" in str(err):
                 Devices[UNIT_STORAGE].Update(nValue=0, sValue="Not supported by this iLO version")
             else:
