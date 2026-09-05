@@ -2,13 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.5
+Version: 1.2.6
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.5" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.6" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <h2>HP Integrated Lights-Out (iLO)</h2>
-        <p><strong>Version:</strong> 1.2.5</p>
+        <p><strong>Version:</strong> 1.2.6</p>
         <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
         <h3>Features</h3>
         <ul>
@@ -116,7 +116,7 @@ SENSOR_DEFINITIONS = [
     (UNIT_SERVER_NAME, "Server Name",       243, 19, {}),
     (UNIT_POWER_STATE, "Power State",       243, 19, {}),
     (UNIT_HEALTH,      "Health",            243, 22, {}),
-    (UNIT_SSD_LIFETIME, "SSD Lifetime",      243,  6, {}),
+    (UNIT_SSD_LIFETIME, "SSD Lifetime",      243,  6, {"Migrated": "1"}),
     (UNIT_CPU_TEMP,    "CPU Temperature",    80,  5, {"Custom": "1;C"}),
     (UNIT_INLET_TEMP,  "Inlet Temperature",  80,  5, {"Custom": "1;C"}),
     (UNIT_FIRMWARE,    "iLO Firmware",      243, 19, {}),
@@ -438,7 +438,13 @@ class BasePlugin:
 
         if UNIT_SSD_LIFETIME in Devices:
             try:
-                if Devices[UNIT_SSD_LIFETIME].Name != "SSD Lifetime":
+                # Checks a marker in Options rather than Name/TypeName: Name is
+                # freely user-editable in the Domoticz UI, so comparing against
+                # a fixed string here would re-trigger this migration (and wipe
+                # any custom name) on every single restart for anyone who ever
+                # renamed the device - this migration should run at most once.
+                options = getattr(Devices[UNIT_SSD_LIFETIME], "Options", {}) or {}
+                if options.get("Migrated") != "1":
                     Devices[UNIT_SSD_LIFETIME].Delete()
                     Domoticz.Log("Recreated unit 4 as SSD Lifetime")
             except Exception as err:
