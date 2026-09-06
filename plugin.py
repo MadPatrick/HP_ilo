@@ -26,7 +26,6 @@ Version: 1.2.6
         <param field="Username" label="Username"              width="150px" required="true" default="Administrator"/>
         <param field="Password" label="Password"              width="150px" required="true" default="" password="true"/>
         <param field="Mode1"    label="Poll interval (sec)"   width="75px"  required="true" default="300"/>
-        <param field="Mode2"    label="CA Certificate Path (optional, leave empty to disable verification)" width="300px" required="false" default=""/>
         <param field="Mode6"    label="Debug"                 width="100px">
             <options>
                 <option label="Off" value="0" default="true"/>
@@ -249,16 +248,6 @@ class BasePlugin:
         connection setup instead of a clear, expected message."""
         return globals().get('Parameters', {})
 
-    def _get_ca_cert_path(self):
-        """Return the user-configured CA certificate path (Mode2), or None if unset.
-
-        Leaving this empty preserves today's behaviour exactly (no certificate
-        verification, InsecureRequestWarning suppressed). Providing a path opts
-        into verifying the iLO's certificate against it.
-        """
-        value = self._parameters.get("Mode2", "").strip()
-        return value or None
-
     def _feature_blocked(self, supported_attr, retry_attr):
         """Return True if a control feature is currently known-unsupported and still
         within its retry cooldown. If the cooldown has elapsed, reset the feature's
@@ -327,8 +316,7 @@ class BasePlugin:
                 host=parameters["Address"],
                 username=parameters["Username"],
                 password=parameters["Password"],
-                port=int(parameters["Port"]),
-                ca_cert=self._get_ca_cert_path()
+                port=int(parameters["Port"])
             )
             self._rf_created_at = now
         return self._rf
