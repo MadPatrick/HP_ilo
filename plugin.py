@@ -239,6 +239,16 @@ class BasePlugin:
         """Safely access the Domoticz Devices global, returning an empty dict if unavailable."""
         return globals().get('Devices', {})
 
+    @property
+    def _parameters(self):
+        """Safely access the Domoticz Parameters global, returning an empty dict if
+        unavailable. Domoticz can deliver a queued onCommand callback (e.g. one sent
+        right before a full Domoticz restart) before this plugin's own Start()
+        sequence has finished injecting Parameters - without this, that raises a
+        confusing 'name Parameters is not defined' NameError deep inside Redfish
+        connection setup instead of a clear, expected message."""
+        return globals().get('Parameters', {})
+
     def _get_ca_cert_path(self):
         """Return the user-configured CA certificate path (Mode2), or None if unset.
 
@@ -246,7 +256,7 @@ class BasePlugin:
         verification, InsecureRequestWarning suppressed). Providing a path opts
         into verifying the iLO's certificate against it.
         """
-        value = Parameters.get("Mode2", "").strip()
+        value = self._parameters.get("Mode2", "").strip()
         return value or None
 
     def _feature_blocked(self, supported_attr, retry_attr):
@@ -308,11 +318,16 @@ class BasePlugin:
             self._rf = None
 
         if self._rf is None:
+            parameters = self._parameters
+            if not parameters:
+                raise RuntimeError(
+                    "Domoticz Parameters not available yet (plugin still starting up); try again shortly"
+                )
             self._rf = RedfishILO(
-                host=Parameters["Address"],
-                username=Parameters["Username"],
-                password=Parameters["Password"],
-                port=int(Parameters["Port"]),
+                host=parameters["Address"],
+                username=parameters["Username"],
+                password=parameters["Password"],
+                port=int(parameters["Port"]),
                 ca_cert=self._get_ca_cert_path()
             )
             self._rf_created_at = now
