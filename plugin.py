@@ -2,13 +2,13 @@
 HP Integrated Lights-Out (iLO) - Domoticz Python Plugin
 
 Author: MadPatrick
-Version: 1.2.6
+Version: 1.2.7
 
 <plugin key="hp_ilo" name="HP Integrated Lights-Out (iLO)" author="MadPatrick"
-        version="1.2.6" externallink="https://github.com/MadPatrick/HP_ilo">
+        version="1.2.7" externallink="https://github.com/MadPatrick/HP_ilo">
     <description>
         <h2>HP Integrated Lights-Out (iLO)</h2>
-        <p><strong>Version:</strong> 1.2.6</p>
+        <p><strong>Version:</strong> 1.2.7</p>
         <p>Monitors and configures an HPE server through the iLO Redfish API.</p>
         <h3>Features</h3>
         <ul>
@@ -42,6 +42,7 @@ import redfish
 import json
 import threading
 import queue
+import time
 from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -199,6 +200,12 @@ class BasePlugin:
     # silently stop updating forever between age-based refreshes.
     SESSION_MAX_AGE = timedelta(minutes=25)
 
+    # How long onStop() waits for an already-running fetch worker to finish
+    # before giving up on it. The worker's Redfish calls are themselves
+    # bounded by RedfishILO.CONNECT_TIMEOUT, so this only needs a small
+    # margin on top of that for the one in-flight HTTP request to complete.
+    WORKER_STOP_TIMEOUT = RedfishILO.CONNECT_TIMEOUT + 2
+
     def __init__(self):
         self.debug               = False
         self.poll_interval       = 300
@@ -224,6 +231,11 @@ class BasePlugin:
         self._rf_created_at = None
         self._redfish_lock = threading.Lock()
 
+        # Set by onStop() to block any new fetch worker from starting and to
+        # let a running one wind down early, so onStop() never has to wait
+        # behind _redfish_lock for a worker that keeps starting new work.
+        self._stop_event = threading.Event()
+
         # The heartbeat's Redfish fetch runs on a background thread so a
         # slow/unreachable iLO never blocks Domoticz's single callback thread.
         # The worker only calls rf.get(...) (via _gather_all_sections, which
@@ -231,6 +243,7 @@ class BasePlugin:
         # updates on the main thread via _apply_all_sections().
         self._fetch_lock = threading.Lock()
         self._fetch_in_progress = False
+        self._fetch_thread = None
         self._result_queue = queue.Queue()
 
     @property
@@ -380,6 +393,7 @@ class BasePlugin:
                 device.Update(nValue=device.nValue, sValue=device.sValue, Image=self.imageID)
 
     def onStart(self):
+        self._stop_event.clear()
         self.debug = Parameters["Mode6"] == "1"
         if self.debug:
             Domoticz.Debugging(1)
@@ -398,6 +412,33 @@ class BasePlugin:
         self._connect_and_update()
 
     def onStop(self):
+        start = time.time()
+
+        # 1/2. Mark shutdown so no new fetch worker can start (see
+        # _connect_and_update), before we go anywhere near _redfish_lock -
+        # a running worker may currently be holding it.
+        self._stop_event.set()
+        if self.debug:
+            Domoticz.Log("HP iLO: shutdown requested.")
+
+        # 3/4. Let an already-running worker finish on its own - bounded by
+        # WORKER_STOP_TIMEOUT, never an unbounded join() - before touching
+        # the lock it may hold.
+        thread = self._fetch_thread
+        if thread is not None and thread.is_alive():
+            if self.debug:
+                Domoticz.Log("HP iLO: waiting for active Redfish worker.")
+            thread.join(timeout=self.WORKER_STOP_TIMEOUT)
+            if thread.is_alive():
+                Domoticz.Error("HP iLO: fetch worker did not stop within shutdown timeout.")
+            elif self.debug:
+                Domoticz.Log("HP iLO: Redfish worker finished.")
+        self._fetch_thread = None
+
+        # 5/6. Only now take _redfish_lock - the worker can no longer be
+        # holding it - and close the persistent session.
+        if self.debug:
+            Domoticz.Log("HP iLO: closing Redfish session.")
         with self._redfish_lock:
             if self._rf is not None:
                 try:
@@ -405,9 +446,17 @@ class BasePlugin:
                 except Exception:
                     pass
                 self._rf = None
-        Domoticz.Log("Plugin stopped")
+                self._rf_created_at = None
+
+        Domoticz.Log("HP iLO: Plugin stopped ({:.2f}s).".format(time.time() - start))
 
     def onHeartbeat(self):
+        # Shutdown in progress: stop producing new Devices[...] updates
+        # rather than processing whatever the worker queued up right before
+        # it wound down.
+        if self._stop_event.is_set():
+            return
+
         # Process any fetch cycle the background worker finished since the
         # last tick - main/callback thread, safe here to touch Devices[...].
         while True:
@@ -426,6 +475,10 @@ class BasePlugin:
             self._connect_and_update()
 
     def onCommand(self, Unit, Command, Level, Color):
+        # Shutdown already in progress: don't kick off a new synchronous
+        # Redfish call that would only delay it further.
+        if self._stop_event.is_set():
+            return
         if Unit == UNIT_MIN_FAN_SPEED:
             self._handle_min_fan_speed_command(Command, Level)
             return
@@ -686,14 +739,27 @@ class BasePlugin:
     def _connect_and_update(self):
         """Starts the background worker for one Redfish refresh cycle. Runs on
         the main thread; only starts a thread and returns immediately."""
+        if self._stop_event.is_set():
+            return
+
         with self._fetch_lock:
             if self._fetch_in_progress:
                 if self.debug:
                     Domoticz.Log("Redfish fetch already in progress, skipping this heartbeat trigger.")
                 return
+            # Re-check under the lock: shutdown may have started while we
+            # were waiting for it, and this must not be the call that starts
+            # a worker after onStop() has already begun.
+            if self._stop_event.is_set():
+                return
             self._fetch_in_progress = True
 
-        threading.Thread(target=self._fetchWorker, daemon=True).start()
+        self._fetch_thread = threading.Thread(
+            target=self._fetchWorker,
+            name="HP-iLO-Fetch",
+            daemon=True
+        )
+        self._fetch_thread.start()
 
     def _fetchWorker(self):
         """Runs on a background thread. Uses the persistent Redfish session to
@@ -701,6 +767,10 @@ class BasePlugin:
         and hands the result back through self._result_queue. Devices[...]
         updates happen in _apply_all_sections(), on the main thread, from
         onHeartbeat."""
+        if self._stop_event.is_set():
+            return
+        if self.debug:
+            Domoticz.Log("HP iLO: Redfish worker started.")
         try:
             bundle = self._with_redfish(self._gather_all_sections)
             self._result_queue.put(("ok", bundle))
@@ -709,6 +779,8 @@ class BasePlugin:
         finally:
             with self._fetch_lock:
                 self._fetch_in_progress = False
+            if self.debug:
+                Domoticz.Log("HP iLO: Redfish worker finished.")
 
     def _get_hpe_oem(self, data):
         oem = data.get("Oem", {})
@@ -990,6 +1062,9 @@ class BasePlugin:
         except Exception as err:
             bundle["system_error"] = str(err)
 
+        if self._stop_event.is_set():
+            return bundle
+
         # Power Regulator
         try:
             if system_uri is None:
@@ -998,6 +1073,9 @@ class BasePlugin:
             bundle["power_regulator_value"] = self._get_bios_attribute_value(bios, POWER_REGULATOR_KEYS)
         except Exception as err:
             bundle["power_regulator_error"] = str(err)
+
+        if self._stop_event.is_set():
+            return bundle
 
         # Thermal
         try:
@@ -1026,12 +1104,18 @@ class BasePlugin:
         except Exception as err:
             bundle["thermal_error"] = str(err)
 
+        if self._stop_event.is_set():
+            return bundle
+
         # Firmware
         try:
             manager = rf.get(self._get_first_member_uri(rf, managers_path))
             bundle["firmware"] = manager.get("FirmwareVersion", "Unknown")
         except Exception as err:
             bundle["firmware_error"] = str(err)
+
+        if self._stop_event.is_set():
+            return bundle
 
         # Network
         try:
@@ -1043,6 +1127,9 @@ class BasePlugin:
             bundle["network"] = "IP: {} | MAC: {}".format(ip, mac)
         except Exception as err:
             bundle["network_error"] = str(err)
+
+        if self._stop_event.is_set():
+            return bundle
 
         # Storage
         try:
